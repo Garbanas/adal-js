@@ -3,6 +3,13 @@ import { Injectable } from '@angular/core';
 import { Observable, bindCallback, timer } from 'rxjs';
 import { map } from 'rxjs/operators';
 
+import { guid } from './utilities/guid';
+import { JwtUtility } from './utilities/jwt-utilty';
+import { Storage } from './storage/storage';
+import { localStorageSupported, sessionStorageSupported } from './storage/storage-helper';
+import { LocalStorage } from './storage/local.storage';
+import { SessionStorage } from './storage/session.storage';
+
 export function deepCopy<T extends any>(value: T): T {
     if (Array.isArray(value)) {
         return value.map((o: T) => deepCopy(o));
@@ -19,36 +26,6 @@ export function deepCopy<T extends any>(value: T): T {
         return copy;
     } else {
         return value;
-    }
-}
-
-/**
- * Returns true if browser supports localStorage, false otherwise.
- */
-export function localStorageSupported(): boolean {
-    const test = 'adalStorageTest';
-    try {
-        window.localStorage.setItem(test, test);
-        window.localStorage.removeItem(test);
-
-        return true;
-    } catch (e) {
-        return false;
-    }
-}
-
-/**
- * Returns true if browser supports sessionStorage, false otherwise.
- */
-export function sessionStorageSupported(): boolean {
-    const test = 'adalStorageTest';
-    try {
-        window.sessionStorage.setItem(test, test);
-        window.sessionStorage.removeItem(test);
-
-        return true;
-    } catch (e) {
-        return false;
     }
 }
 
@@ -70,12 +47,6 @@ declare var Logging: {
     log: (message: string) => void;
     level: LOGGING_LEVEL;
 };
-
-export interface JwtPayload {
-    aud?: string;
-    upn?: string;
-    email?: string;
-}
 
 export interface RequestInfoParameters {
     id_token?: string;
@@ -164,156 +135,6 @@ export interface UserCallback {
     (error?: string, user?: User | null): void;
 }
 
-export class AdalUtility {
-    /**
-     * Generates RFC4122 version 4 guid (128 bits)
-     */
-    public static guid(): string {
-        // tslint:disable no-bitwise comment-format number-literal-format
-
-        // RFC4122: The version 4 UUID is meant for generating UUIDs from truly-random or
-        // pseudo-random numbers.
-        // The algorithm is as follows:
-        //     Set the two most significant bits (bits 6 and 7) of the
-        //        clock_seq_hi_and_reserved to zero and one, respectively.
-        //     Set the four most significant bits (bits 12 through 15) of the
-        //        time_hi_and_version field to the 4-bit version number from
-        //        Section 4.1.3. Version4
-        //     Set all the other bits to randomly (or pseudo-randomly) chosen
-        //     values.
-        // UUID                   = time-low "-" time-mid "-"time-high-and-version "-"clock-seq-reserved and low(2hexOctet)"-" node
-        // time-low               = 4hexOctet
-        // time-mid               = 2hexOctet
-        // time-high-and-version  = 2hexOctet
-        // clock-seq-and-reserved = hexOctet:
-        // clock-seq-low          = hexOctet
-        // node                   = 6hexOctet
-        // Format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
-        // y could be 1000, 1001, 1010, 1011 since most significant two bits needs to be 10
-        // y values are 8, 9, A, B
-        const cryptoObj = window.crypto || (window as any).msCrypto; // for IE 11
-        if (cryptoObj && cryptoObj.getRandomValues) {
-            const buffer = new Uint8Array(16);
-            cryptoObj.getRandomValues(buffer);
-
-            //buffer[6] and buffer[7] represents the time_hi_and_version field. We will set the four most significant bits (4 through 7) of buffer[6] to represent decimal number 4 (UUID version number).
-            buffer[6] |= 0x40; //buffer[6] | 01000000 will set the 6 bit to 1.
-            buffer[6] &= 0x4f; //buffer[6] & 01001111 will set the 4, 5, and 7 bit to 0 such that bits 4-7 == 0100 = "4".
-            //buffer[8] represents the clock_seq_hi_and_reserved field. We will set the two most significant bits (6 and 7) of the clock_seq_hi_and_reserved to zero and one, respectively.
-            buffer[8] |= 0x80; //buffer[8] | 10000000 will set the 7 bit to 1.
-            buffer[8] &= 0xbf; //buffer[8] & 10111111 will set the 6 bit to 0.
-
-            const decimalToHex = AdalUtility.decimalToHex;
-
-            return decimalToHex(buffer[0]) + decimalToHex(buffer[1]) + decimalToHex(buffer[2]) + decimalToHex(buffer[3]) + '-' + decimalToHex(buffer[4]) + decimalToHex(buffer[5]) + '-' + decimalToHex(buffer[6]) + decimalToHex(buffer[7]) + '-' +
-                decimalToHex(buffer[8]) + decimalToHex(buffer[9]) + '-' + decimalToHex(buffer[10]) + decimalToHex(buffer[11]) + decimalToHex(buffer[12]) + decimalToHex(buffer[13]) + decimalToHex(buffer[14]) + decimalToHex(buffer[15]);
-
-        } else {
-            const guidHolder = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
-            const hex = '0123456789abcdef';
-            let r = 0;
-            let guidResponse = '';
-            for (let i = 0; i < 36; i++) {
-                if (guidHolder[i] !== '-' && guidHolder[i] !== '4') {
-                    // each x and y needs to be random
-                    r = Math.random() * 16 | 0;
-                }
-                if (guidHolder[i] === 'x') {
-                    guidResponse += hex[r];
-                } else if (guidHolder[i] === 'y') {
-                    // clock-seq-and-reserved first hex is filtered and remaining hex values are random
-                    r &= 0x3; // bit and with 0011 to set pos 2 to zero ?0??
-                    r |= 0x8; // set pos 3 to 1 as 1???
-                    guidResponse += hex[r];
-                } else {
-                    guidResponse += guidHolder[i];
-                }
-            }
-
-            return guidResponse;
-        }
-        // tslint:enable
-    }
-
-    /**
-     * Converts decimal value to hex equivalent
-     */
-    public static decimalToHex(value: number): string {
-        let hex = value.toString(16);
-
-        while (hex.length < 2) {
-            hex = '0' + hex;
-        }
-
-        return hex;
-    }
-
-    /**
-     * Returns the decoded JSON web token payload.
-     *
-     * @param {string} jwt
-     * @throws Will throw an error if the token can not be decoded.
-     */
-    public static getPayloadFromToken(jwt: string): JwtPayload | null {
-        const decodedToken = AdalUtility.decodeJwt(jwt);
-        if (!decodedToken) {
-            return null;
-        }
-
-        const base64Decoded = AdalUtility.base64DecodeStringUrlSafe(decodedToken.JWSPayload);
-        if (!base64Decoded) {
-            throw new Error('The token could not be base64 url safe decoded.');
-        }
-
-        try {
-            return JSON.parse(base64Decoded);
-        } catch (error) {
-            throw new Error('The token could not be JSON decoded');
-        }
-    }
-
-    /**
-     * Decodes a JSON web token into an object with header, payload and signature fields.
-     *
-     * @param {string} [jwt]
-     * @throws Will throw an error if the argument is not parsable.
-     */
-    public static decodeJwt(jwt?: string): { header: string, JWSPayload: string, JWSSig: string } | null {
-        if (!jwt) {
-            return null;
-        }
-
-        const idTokenPartsRegex = /^([^\.\s]*)\.([^\.\s]+)\.([^\.\s]*)$/;
-
-        const matches = idTokenPartsRegex.exec(jwt);
-        if (!matches || matches.length < 4) {
-            throw new Error('The given JSON web token is not parsable.');
-        }
-
-        return {
-            header: matches[1],
-            JWSPayload: matches[2],
-            JWSSig: matches[3],
-        };
-    }
-
-    /**
-     * Decodes a string of data which has been encoded using base-64 encoding.
-     *
-     * @param {string} base64Token
-     */
-    public static base64DecodeStringUrlSafe(base64Token: string): string {
-        return decodeURIComponent(
-            escape(
-                atob(
-                    base64Token.replace(/-/g, '+')
-                        .replace(/_/g, '/')
-                )
-            )
-        );
-    }
-}
-
 /**
  * Configuration options for Authentication Context.
  */
@@ -399,6 +220,8 @@ export interface Config {
     callback?: TokenCallback;
 
     slice?: string;
+
+    storage?: Storage;
 }
 
 export interface InternalConfig extends Config {
@@ -521,6 +344,8 @@ export class AuthenticationContext {
         return this._state;
     }
 
+    public readonly storage: Storage;
+
     // private
     private _user: User | null = null;
     private _activeRenewals: Map<string, string> = new Map();
@@ -553,6 +378,8 @@ export class AuthenticationContext {
         const configClone = deepCopy(config) as InternalConfig;
 
         this.callback = () => {}; // tslint:disable-line no-empty
+
+        this.storage = this.getStorageImplementation(configClone);
 
         if (config.navigateToLoginRequestUrl === undefined) {
             config.navigateToLoginRequestUrl = true;
@@ -614,24 +441,26 @@ export class AuthenticationContext {
         this._loginInProgress = true;
 
         // Token is not present and user needs to login
-        const expectedState = AdalUtility.guid();
+        const expectedState = guid();
         this._state = expectedState;
-        const idTokenNonce = AdalUtility.guid();
-        let loginStartPage = this.getItem(this.STORAGE_CONSTANTS.ANGULAR_LOGIN_REQUEST);
+        const idTokenNonce = guid();
+        let loginStartPage = this.storage.get(this.STORAGE_CONSTANTS.ANGULAR_LOGIN_REQUEST);
 
         if (!loginStartPage || loginStartPage === '') {
             loginStartPage = window.location.href;
         } else {
-            this._saveItem(this.STORAGE_CONSTANTS.ANGULAR_LOGIN_REQUEST, '');
+            this.storage.set(this.STORAGE_CONSTANTS.ANGULAR_LOGIN_REQUEST, '');
         }
 
         this.verbose('Expected state: ' + expectedState + ' startPage:' + loginStartPage);
-        this._saveItem(this.STORAGE_CONSTANTS.LOGIN_REQUEST, loginStartPage);
-        this._saveItem(this.STORAGE_CONSTANTS.LOGIN_ERROR, '');
-        this._saveItem(this.STORAGE_CONSTANTS.STATE_LOGIN, expectedState, true);
-        this._saveItem(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, idTokenNonce, true);
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR, '');
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
+        this.storage.set(this.STORAGE_CONSTANTS.LOGIN_REQUEST, loginStartPage);
+        this.storage.set(this.STORAGE_CONSTANTS.LOGIN_ERROR, '');
+        const existingLoginState = this.storage.get(this.STORAGE_CONSTANTS.STATE_LOGIN) || '';
+        this.storage.set(this.STORAGE_CONSTANTS.STATE_LOGIN, existingLoginState + expectedState + this.CONSTANTS.CACHE_DELIMETER);
+        const existingIdTokenNonce = this.storage.get(this.STORAGE_CONSTANTS.NONCE_IDTOKEN) || '';
+        this.storage.set(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, existingIdTokenNonce + idTokenNonce + this.CONSTANTS.CACHE_DELIMETER);
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR, '');
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
         const urlNavigate = this._getNavigateUrl(RESPONSE_TYPE.ID_TOKEN) + '&nonce=' + encodeURIComponent(idTokenNonce);
 
         if (this.config.displayCall) {
@@ -639,7 +468,7 @@ export class AuthenticationContext {
             this.config.displayCall(urlNavigate);
 
         } else if (this.popUp) {
-            this._saveItem(this.STORAGE_CONSTANTS.STATE_LOGIN, ''); // so requestInfo does not match redirect case
+            this.storage.set(this.STORAGE_CONSTANTS.STATE_LOGIN, ''); // so requestInfo does not match redirect case
             this._renewStates.push(expectedState);
             this.registerCallback(expectedState, this.config.clientId, this.callback);
             this._loginPopup(urlNavigate);
@@ -687,9 +516,9 @@ export class AuthenticationContext {
 
     protected _handlePopupError(loginCallback?: TokenCallback | null, resource?: string, error?: string | null, errorDesc?: string | null, loginError?: string | null): void {
         this.warn(errorDesc!);
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR, error);
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, errorDesc);
-        this._saveItem(this.STORAGE_CONSTANTS.LOGIN_ERROR, loginError);
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR, error || '');
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, errorDesc || '');
+        this.storage.set(this.STORAGE_CONSTANTS.LOGIN_ERROR, loginError || '');
 
         if (resource) {
             this._activeRenewals.delete(resource);
@@ -803,7 +632,7 @@ export class AuthenticationContext {
      * @returns {boolean} - 'true' if login is in progress, else returns 'false'.
      */
     protected _hasResource(key: string): boolean {
-        const keys = this.getItem(this.STORAGE_CONSTANTS.TOKEN_KEYS);
+        const keys = this.storage.get(this.STORAGE_CONSTANTS.TOKEN_KEYS);
 
         return !!keys
             && (keys.indexOf(key + this.CONSTANTS.RESOURCE_DELIMETER) !== -1);
@@ -820,18 +649,18 @@ export class AuthenticationContext {
             return null;
         }
 
-        const token = this.getItem(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource);
-        const expiration = this.getItem(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource);
+        const token = this.storage.get(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource);
+        const expiration = this.storage.get(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource);
         const expiry = (expiration ? parseInt(expiration, 10) : null);
 
         // If expiration is within offset, it will force renew
         const offset = this.config.expireOffsetSeconds || 300;
 
         if (expiry && (expiry > this._now() + offset)) {
-            return token;
+            return token || null;
         } else {
-            this._saveItem(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, '');
-            this._saveItem(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource, 0);
+            this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, '');
+            this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource, '0');
 
             return null;
         }
@@ -849,7 +678,7 @@ export class AuthenticationContext {
 
         let user = null;
 
-        const idToken = this.getItem(this.STORAGE_CONSTANTS.IDTOKEN);
+        const idToken = this.storage.get(this.STORAGE_CONSTANTS.IDTOKEN);
         if (idToken) {
             user = this._createUserFromIdToken(idToken);
         }
@@ -902,7 +731,7 @@ export class AuthenticationContext {
         // use given resource to create new authz url
         this.info('renewToken is called for resource:' + resource);
         const frameHandle = this._addAdalFrame('adalRenewFrame' + resource);
-        const expectedState = AdalUtility.guid() + '|' + resource;
+        const expectedState = guid() + '|' + resource;
 
         this._state = expectedState;
         // renew happens in iframe, so it keeps javascript context
@@ -914,8 +743,9 @@ export class AuthenticationContext {
         let urlNavigate = this._urlRemoveQueryStringParameter(this._getNavigateUrl(responseType, resource), 'prompt');
 
         if (responseType === this.RESPONSE_TYPE.ID_TOKEN_TOKEN) {
-            const idTokenNonce = AdalUtility.guid();
-            this._saveItem(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, idTokenNonce, true);
+            const idTokenNonce = guid();
+            const existingIdTokenNonce = this.storage.get(this.STORAGE_CONSTANTS.NONCE_IDTOKEN) || '';
+            this.storage.set(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, existingIdTokenNonce + idTokenNonce + this.CONSTANTS.CACHE_DELIMETER);
             urlNavigate += '&nonce=' + encodeURIComponent(idTokenNonce);
         }
 
@@ -936,10 +766,11 @@ export class AuthenticationContext {
         // use iframe to try to renew token
         this.info('renewIdToken is called');
         const frameHandle = this._addAdalFrame('adalIdTokenFrame');
-        const expectedState = AdalUtility.guid() + '|' + this.config.clientId;
+        const expectedState = guid() + '|' + this.config.clientId;
 
-        const idTokenNonce = AdalUtility.guid();
-        this._saveItem(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, idTokenNonce, true);
+        const idTokenNonce = guid();
+        const existingIdTokenNonce = this.storage.get(this.STORAGE_CONSTANTS.NONCE_IDTOKEN) || '';
+        this.storage.set(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, existingIdTokenNonce + idTokenNonce + this.CONSTANTS.CACHE_DELIMETER);
 
         this._state = expectedState;
         // renew happens in iframe, so it keeps javascript context
@@ -997,11 +828,11 @@ export class AuthenticationContext {
     protected _loadFrameTimeout(urlNavigation: string, frameName: string, resource: string): void {
         // Set iframe session to pending
         this.verbose('Set loading state to pending for: ' + resource);
-        this._saveItem(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_IN_PROGRESS);
+        this.storage.set(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_IN_PROGRESS);
         this._loadFrame(urlNavigation, frameName);
 
         setTimeout(() => {
-            if (this.getItem(this.STORAGE_CONSTANTS.RENEW_STATUS + resource) === this.CONSTANTS.TOKEN_RENEW_STATUS_IN_PROGRESS) {
+            if (this.storage.get(this.STORAGE_CONSTANTS.RENEW_STATUS + resource) === this.CONSTANTS.TOKEN_RENEW_STATUS_IN_PROGRESS) {
                 // fail the iframe session if it's in pending state
                 this.verbose('Loading frame has timed out after: ' + (this.CONSTANTS.LOADFRAME_TIMEOUT / 1000) + ' seconds for resource ' + resource);
                 const expectedState = this._activeRenewals.get(resource);
@@ -1013,7 +844,7 @@ export class AuthenticationContext {
                     }
                 }
 
-                this._saveItem(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_CANCELED);
+                this.storage.set(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_CANCELED);
             }
         }, this.CONSTANTS.LOADFRAME_TIMEOUT);
     }
@@ -1132,7 +963,7 @@ export class AuthenticationContext {
             return;
         }
 
-        const expectedState = AdalUtility.guid() + '|' + resource;
+        const expectedState = guid() + '|' + resource;
         this._state = expectedState;
         this._renewStates.push(expectedState);
         this._requestType = REQUEST_TYPE.RENEW_TOKEN;
@@ -1189,7 +1020,7 @@ export class AuthenticationContext {
             return;
         }
 
-        const expectedState = AdalUtility.guid() + '|' + resource;
+        const expectedState = guid() + '|' + resource;
         this._state = expectedState;
         this.verbose('Renew token Expected state: ' + expectedState);
 
@@ -1210,8 +1041,9 @@ export class AuthenticationContext {
         urlNavigate = this._addHintParameters(urlNavigate);
         this._acquireTokenInProgress = true;
         this.info('acquireToken interactive is called for the resource ' + resource);
-        this._saveItem(this.STORAGE_CONSTANTS.LOGIN_REQUEST, window.location.href);
-        this._saveItem(this.STORAGE_CONSTANTS.STATE_RENEW, expectedState, true);
+        this.storage.set(this.STORAGE_CONSTANTS.LOGIN_REQUEST, window.location.href);
+        const existingState = this.storage.get(this.STORAGE_CONSTANTS.STATE_RENEW) || '';
+        this.storage.set(this.STORAGE_CONSTANTS.STATE_RENEW, existingState + expectedState + this.CONSTANTS.CACHE_DELIMETER);
         this.promptUser(urlNavigate);
     }
 
@@ -1233,32 +1065,32 @@ export class AuthenticationContext {
      * Clears cache items.
      */
     public clearCache(): void {
-        this._saveItem(this.STORAGE_CONSTANTS.LOGIN_REQUEST, '');
-        this._saveItem(this.STORAGE_CONSTANTS.ANGULAR_LOGIN_REQUEST, '');
-        this._saveItem(this.STORAGE_CONSTANTS.SESSION_STATE, '');
-        this._saveItem(this.STORAGE_CONSTANTS.STATE_LOGIN, '');
-        this._saveItem(this.STORAGE_CONSTANTS.STATE_RENEW, '');
+        this.storage.set(this.STORAGE_CONSTANTS.LOGIN_REQUEST, '');
+        this.storage.set(this.STORAGE_CONSTANTS.ANGULAR_LOGIN_REQUEST, '');
+        this.storage.set(this.STORAGE_CONSTANTS.SESSION_STATE, '');
+        this.storage.set(this.STORAGE_CONSTANTS.STATE_LOGIN, '');
+        this.storage.set(this.STORAGE_CONSTANTS.STATE_RENEW, '');
         this._renewStates = [];
-        this._saveItem(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, '');
-        this._saveItem(this.STORAGE_CONSTANTS.IDTOKEN, '');
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR, '');
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
-        this._saveItem(this.STORAGE_CONSTANTS.LOGIN_ERROR, '');
-        this._saveItem(this.STORAGE_CONSTANTS.LOGIN_ERROR, '');
+        this.storage.set(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, '');
+        this.storage.set(this.STORAGE_CONSTANTS.IDTOKEN, '');
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR, '');
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
+        this.storage.set(this.STORAGE_CONSTANTS.LOGIN_ERROR, '');
+        this.storage.set(this.STORAGE_CONSTANTS.LOGIN_ERROR, '');
 
-        const keys = this.getItem(this.STORAGE_CONSTANTS.TOKEN_KEYS);
+        const keys = this.storage.get(this.STORAGE_CONSTANTS.TOKEN_KEYS);
         if (keys) {
             const tokenKeys = keys.split(this.CONSTANTS.RESOURCE_DELIMETER);
             for (let i = 0; i < tokenKeys.length; i += 1) {
                 const tokenValue = tokenKeys[i];
                 if (tokenValue !== '') {
-                    this._saveItem(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + tokenValue, '');
-                    this._saveItem(this.STORAGE_CONSTANTS.EXPIRATION_KEY + tokenValue, 0);
+                    this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + tokenValue, '');
+                    this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + tokenValue, '0');
                 }
             }
         }
 
-        this._saveItem(this.STORAGE_CONSTANTS.TOKEN_KEYS, '');
+        this.storage.set(this.STORAGE_CONSTANTS.TOKEN_KEYS, '');
     }
 
     /**
@@ -1267,13 +1099,13 @@ export class AuthenticationContext {
      * @param {string} resource  -  A URI that identifies the resource.
      */
     public clearCacheForResource(resource: string): void {
-        this._saveItem(this.STORAGE_CONSTANTS.STATE_RENEW, '');
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR, '');
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
+        this.storage.set(this.STORAGE_CONSTANTS.STATE_RENEW, '');
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR, '');
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
 
         if (this._hasResource(resource)) {
-            this._saveItem(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, '');
-            this._saveItem(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource, 0);
+            this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, '');
+            this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource, '0');
         }
     }
 
@@ -1322,7 +1154,7 @@ export class AuthenticationContext {
         }
 
         // frame is used to get idtoken
-        const idToken = this.getItem(this.STORAGE_CONSTANTS.IDTOKEN);
+        const idToken = this.storage.get(this.STORAGE_CONSTANTS.IDTOKEN);
         if (!!idToken) {
             this.info('User exists in cache: ');
             this._user = this._createUserFromIdToken(idToken);
@@ -1380,7 +1212,7 @@ export class AuthenticationContext {
      */
     protected _createUserFromIdToken(idToken: string): User | null {
         let user = null;
-        const parsedJson = AdalUtility.getPayloadFromToken(idToken);
+        const parsedJson = JwtUtility.getPayloadFromToken(idToken);
 
         if (parsedJson && parsedJson.aud !== undefined) {
             if (parsedJson.aud.toLowerCase() === this.config.clientId.toLowerCase()) {
@@ -1444,7 +1276,7 @@ export class AuthenticationContext {
      * @returns {string} Error message related to login.
      */
     public getLoginError(): string | null {
-        return this.getItem(this.STORAGE_CONSTANTS.LOGIN_ERROR);
+        return this.storage.get(this.STORAGE_CONSTANTS.LOGIN_ERROR) || null;
     }
 
     /**
@@ -1510,7 +1342,7 @@ export class AuthenticationContext {
      * Matches nonce from the request with the response.
      */
     protected _matchNonce(user: User): boolean {
-        const requestNonce = this.getItem(this.STORAGE_CONSTANTS.NONCE_IDTOKEN);
+        const requestNonce = this.storage.get(this.STORAGE_CONSTANTS.NONCE_IDTOKEN);
 
         if (requestNonce) {
             const nonces = requestNonce.split(this.CONSTANTS.CACHE_DELIMETER);
@@ -1530,7 +1362,7 @@ export class AuthenticationContext {
      * @param {RequestInfo} requestInfo
      */
     protected _matchState(requestInfo: RequestInfo): boolean {
-        const loginStatesStr = this.getItem(this.STORAGE_CONSTANTS.STATE_LOGIN);
+        const loginStatesStr = this.storage.get(this.STORAGE_CONSTANTS.STATE_LOGIN);
         if (loginStatesStr) {
             const loginStates = loginStatesStr.split(this.CONSTANTS.CACHE_DELIMETER);
             for (let i = 0; i < loginStates.length; i += 1) {
@@ -1543,7 +1375,7 @@ export class AuthenticationContext {
             }
         }
 
-        const acquireTokenStatesStr = this.getItem(this.STORAGE_CONSTANTS.STATE_RENEW);
+        const acquireTokenStatesStr = this.storage.get(this.STORAGE_CONSTANTS.STATE_RENEW);
         if (acquireTokenStatesStr) {
             const acquireTokenStates = acquireTokenStatesStr.split(this.CONSTANTS.CACHE_DELIMETER);
             for (let i = 0; i < acquireTokenStates.length; i += 1) {
@@ -1584,20 +1416,20 @@ export class AuthenticationContext {
      */
     public saveTokenFromHash(requestInfo: RequestInfo): void {
         this.info('State status:' + requestInfo.stateMatch + '; Request type:' + requestInfo.requestType);
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR, '');
-        this._saveItem(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR, '');
+        this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
 
         const resource = this._getResourceFromState(requestInfo.stateResponse);
 
         // Record error
         if (requestInfo.parameters.error_description !== undefined) {
             this.infoPii('Error :' + requestInfo.parameters.error + '; Error description:' + requestInfo.parameters.error_description);
-            this._saveItem(this.STORAGE_CONSTANTS.ERROR, requestInfo.parameters.error);
-            this._saveItem(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, requestInfo.parameters.error_description);
+            this.storage.set(this.STORAGE_CONSTANTS.ERROR, requestInfo.parameters.error || '');
+            this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, requestInfo.parameters.error_description);
 
             if (requestInfo.requestType === REQUEST_TYPE.LOGIN) {
                 this._loginInProgress = false;
-                this._saveItem(this.STORAGE_CONSTANTS.LOGIN_ERROR, requestInfo.parameters.error_description);
+                this.storage.set(this.STORAGE_CONSTANTS.LOGIN_ERROR, requestInfo.parameters.error_description);
             }
         } else {
             // It must verify the state from redirect
@@ -1605,7 +1437,7 @@ export class AuthenticationContext {
                 // record tokens to storage if exists
                 this.info('State is right');
                 if (requestInfo.parameters.session_state !== undefined) {
-                    this._saveItem(this.STORAGE_CONSTANTS.SESSION_STATE, requestInfo.parameters.session_state);
+                    this.storage.set(this.STORAGE_CONSTANTS.SESSION_STATE, requestInfo.parameters.session_state);
                 }
 
                 let keys: string;
@@ -1614,13 +1446,13 @@ export class AuthenticationContext {
                     this.info('Fragment has access token');
 
                     if (!this._hasResource(resource)) {
-                        keys = this.getItem(this.STORAGE_CONSTANTS.TOKEN_KEYS) || '';
-                        this._saveItem(this.STORAGE_CONSTANTS.TOKEN_KEYS, keys + resource + this.CONSTANTS.RESOURCE_DELIMETER);
+                        keys = this.storage.get(this.STORAGE_CONSTANTS.TOKEN_KEYS) || '';
+                        this.storage.set(this.STORAGE_CONSTANTS.TOKEN_KEYS, keys + resource + this.CONSTANTS.RESOURCE_DELIMETER);
                     }
 
                     // save token with related resource
-                    this._saveItem(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters.access_token);
-                    this._saveItem(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource, this._expiresIn(requestInfo.parameters.expires_in));
+                    this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters.access_token);
+                    this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource, `${this._expiresIn(requestInfo.parameters.expires_in)}`);
                 }
 
                 if (requestInfo.parameters.id_token !== undefined) {
@@ -1630,14 +1462,14 @@ export class AuthenticationContext {
 
                     if (this._user && this._user.profile) {
                         if (!this._matchNonce(this._user)) {
-                            this._saveItem(
+                            this.storage.set(
                                 this.STORAGE_CONSTANTS.LOGIN_ERROR,
-                                'Nonce received: ' + this._user.profile.nonce + ' is not same as requested: ' + this.getItem(this.STORAGE_CONSTANTS.NONCE_IDTOKEN)
+                                'Nonce received: ' + this._user.profile.nonce + ' is not same as requested: ' + this.storage.get(this.STORAGE_CONSTANTS.NONCE_IDTOKEN)
                             );
                             this._user = null;
 
                         } else {
-                            this._saveItem(this.STORAGE_CONSTANTS.IDTOKEN, requestInfo.parameters.id_token);
+                            this.storage.set(this.STORAGE_CONSTANTS.IDTOKEN, requestInfo.parameters.id_token);
 
                             // Save idtoken as access token for app itself
                             // resource = this.config.loginResource ? this.config.loginResource : this.config.clientId;
@@ -1645,33 +1477,33 @@ export class AuthenticationContext {
 
                             // if (!this._hasResource(resource)) {
                             if (!this._hasResource(idTokenResource)) {
-                                keys = this.getItem(this.STORAGE_CONSTANTS.TOKEN_KEYS) || '';
-                                // this._saveItem(this.STORAGE_CONSTANTS.TOKEN_KEYS, keys + resource + this.CONSTANTS.RESOURCE_DELIMETER);
-                                this._saveItem(this.STORAGE_CONSTANTS.TOKEN_KEYS, keys + idTokenResource + this.CONSTANTS.RESOURCE_DELIMETER);
+                                keys = this.storage.get(this.STORAGE_CONSTANTS.TOKEN_KEYS) || '';
+                                // this.storage.set(this.STORAGE_CONSTANTS.TOKEN_KEYS, keys + resource + this.CONSTANTS.RESOURCE_DELIMETER);
+                                this.storage.set(this.STORAGE_CONSTANTS.TOKEN_KEYS, keys + idTokenResource + this.CONSTANTS.RESOURCE_DELIMETER);
                             }
 
-                            // this._saveItem(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters[this.CONSTANTS.ID_TOKEN]);
-                            this._saveItem(this.STORAGE_CONSTANTS.EXPIRATION_KEY + idTokenResource, this._user.profile.exp);
-                            // this._saveItem(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters[this.CONSTANTS.ID_TOKEN]);
-                            this._saveItem(this.STORAGE_CONSTANTS.EXPIRATION_KEY + idTokenResource, this._user.profile.exp);
+                            // this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters[this.CONSTANTS.ID_TOKEN]);
+                            this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + idTokenResource, this._user.profile.exp || '');
+                            // this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters[this.CONSTANTS.ID_TOKEN]);
+                            this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + idTokenResource, this._user.profile.exp || '');
                         }
 
                     } else {
                         requestInfo.parameters.error = 'invalid id_token';
                         requestInfo.parameters.error_description = 'Invalid id_token. id_token: ' + requestInfo.parameters.id_token;
-                        this._saveItem(this.STORAGE_CONSTANTS.ERROR, 'invalid id_token');
-                        this._saveItem(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, 'Invalid id_token. id_token: ' + requestInfo.parameters.id_token);
+                        this.storage.set(this.STORAGE_CONSTANTS.ERROR, 'invalid id_token');
+                        this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, 'Invalid id_token. id_token: ' + requestInfo.parameters.id_token);
                     }
                 }
             } else {
                 requestInfo.parameters.error = 'Invalid_state';
                 requestInfo.parameters.error_description = 'Invalid_state. state: ' + requestInfo.stateResponse;
-                this._saveItem(this.STORAGE_CONSTANTS.ERROR, 'Invalid_state');
-                this._saveItem(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, 'Invalid_state. state: ' + requestInfo.stateResponse);
+                this.storage.set(this.STORAGE_CONSTANTS.ERROR, 'Invalid_state');
+                this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, 'Invalid_state. state: ' + requestInfo.stateResponse);
             }
         }
 
-        this._saveItem(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_COMPLETED);
+        this.storage.set(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_COMPLETED);
     }
 
     /**
@@ -1799,7 +1631,7 @@ export class AuthenticationContext {
 
             if (window.parent === window && !isPopup) {
                 if (self.config.navigateToLoginRequestUrl) {
-                    window.location.href = self.getItem(self.STORAGE_CONSTANTS.LOGIN_REQUEST)!;
+                    window.location.href = self.storage.get(self.STORAGE_CONSTANTS.LOGIN_REQUEST)!;
                 } else {
                     window.location.hash = '';
                 }
@@ -1848,7 +1680,7 @@ export class AuthenticationContext {
                 str.push(obj.extraQueryParameter);
             }
 
-            const correlationId = obj.correlationId ? obj.correlationId : AdalUtility.guid();
+            const correlationId = obj.correlationId ? obj.correlationId : guid();
             str.push('client-request-id=' + encodeURIComponent(correlationId));
         }
 
@@ -1921,39 +1753,24 @@ export class AuthenticationContext {
         return adalFrame;
     }
 
-    /**
-     * Saves the key-value pair in the cache
-     */
-    protected _saveItem(key: string, obj: any, preserve?: boolean): boolean {
-
-        if (this.config.cacheLocation === 'localStorage') {
-
-            if (!this.supportsLocalStorage) {
-                this.info('Local storage is not supported');
-
-                return false;
-            }
-
-            if (preserve) {
-                const value = this.getItem(key) || '';
-                localStorage.setItem(key, value + obj + this.CONSTANTS.CACHE_DELIMETER);
-            } else {
-                localStorage.setItem(key, obj);
-            }
-
-            return true;
+    protected getStorageImplementation(config: Config): Storage {
+        if (config.storage) {
+            return config.storage;
         }
 
-        // Default as session storage
-        if (!this.supportsSessionStorage) {
-            this.info('Session storage is not supported');
-
-            return false;
+        if (config.cacheLocation === 'localStorage' && localStorageSupported()) {
+            return new LocalStorage();
         }
 
-        sessionStorage.setItem(key, obj);
+        if (sessionStorageSupported()) {
+            return new SessionStorage();
+        }
 
-        return true;
+        if (config.cacheLocation === 'localStorage') {
+            throw new Error('Neither local storage nor session storage are supported on this device.');
+        } else {
+            throw new Error('Session storage is not supported on this device.');
+        }
     }
 
     /**
@@ -2220,13 +2037,13 @@ export class AdalService {
                     if (requestInfo.requestType === REQUEST_TYPE.RENEW_TOKEN) {
                         // Idtoken or Accestoken can be renewed
                         if (requestInfo.parameters['access_token']) {
-                            this.context.callback(this.context.getItem(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION)
+                            this.context.callback(this.context.storage.get(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION)
                                 , requestInfo.parameters['access_token']);
                         } else if (requestInfo.parameters['id_token']) {
-                            this.context.callback(this.context.getItem(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION)
+                            this.context.callback(this.context.storage.get(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION)
                                 , requestInfo.parameters['id_token']);
                         } else if (requestInfo.parameters['error']) {
-                            this.context.callback(this.context.getItem(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION), null);
+                            this.context.callback(this.context.storage.get(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION), null);
                         }
                     }
                 }
@@ -2364,7 +2181,7 @@ export class AdalService {
 
     private setupLoginTokenRefreshTimer(): void {
         // Get expiration of login token
-        const expirationStr = this.context.getItem(this.context.STORAGE_CONSTANTS.EXPIRATION_KEY + this.context.config.loginResource);
+        const expirationStr = this.context.storage.get(this.context.STORAGE_CONSTANTS.EXPIRATION_KEY + this.context.config.loginResource);
         const expiration = parseInt(expirationStr!, 10);
 
         // Either wait until the refresh window is valid or refresh in 1 second (measured in seconds)
