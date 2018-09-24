@@ -1,0 +1,60 @@
+{
+  "name": "adal-js",
+  "version": "0.0.0",
+  "description": "Windows Azure Active Directory Client Library for JavaScript and TypeScript",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "karma start",
+    "build": "tsc",
+    "lint": "tslint --project tsconfig.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/garbanas/adal-js.git"
+  },
+  "keywords": [
+    "adal",
+    "js",
+    "oauth",
+    "ts"
+  ],
+  "bugs": {
+    "url": "https://github.com/garbanas/adal-js/issues"
+  },
+  "homepage": "https://github.com/garbanas/adal-js#readme",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Christoph Dörfel",
+    "email": "christoph.doerfel@gmail.com"
+  },
+  "contributors": [
+    {
+      "name": "YooApplications AG",
+      "email": "info@yooapps.com",
+      "url": "https://yoo.digital/"
+    }
+  ],
+  "dependencies": {
+    "@angular/common": "~6.1.8",
+    "@angular/core": "^6.1.8",
+    "rxjs": "~6.3.2",
+    "typescript": "2.9.2"
+  },
+  "engines": {
+    "node": ">= 8.11.3",
+    "yarn": ">= 1.7.0"
+  },
+  "devDependencies": {
+    "karma": "^3.0.0",
+    "karma-chrome-launcher": "^2.2.0",
+    "karma-coverage": "^1.1.2",
+    "karma-jasmine": "^1.1.2",
+    "karma-phantomjs-launcher": "^1.0.4",
+    "karma-sourcemap-loader": "^0.3.7",
+    "tslint": "^5.11.0"
+  },
+  "peerDependencies": {
+    "jasmine-core": "^3.2.1",
+    "zone.js": "^0.8.26"
+  }
+}
