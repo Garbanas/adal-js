@@ -897,7 +897,7 @@ export class AuthenticationContext {
         if (token) {
             this.info('Token is already in cache for resource: ' + resource);
 
-            Promise.resolve(token);
+            return Promise.resolve(token);
         }
 
         if (!this.isRoot) {
@@ -2132,18 +2132,8 @@ export class AdalService {
     public acquireToken(resource: string): Observable<string | null> {
         return fromPromise(this.context.acquireToken(resource))
             .pipe(
-                tap(() => {
-                    console.info('TESTING acquireToken promise success');
-                }, () => {
-                    console.info('TESTING acquireToken promise ERROR');
-                }),
                 catchError((error) => throwError('Error when acquiring token for resource "' + resource + '": ' + error)),
-                take(1),
-                tap((token) => {
-                    console.info('TESTING acquireToken promise success', token);
-                }, (error) => {
-                    console.info('TESTING acquireToken promise ERROR', error);
-                })
+                take(1)
             );
     }
 
