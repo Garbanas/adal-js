@@ -77,7 +77,7 @@ rules:
   indent:
     - true
     - spaces
-    - 2
+    - 4
   max-line-length: false
   no-trailing-whitespace: true
   object-literal-sort-keys: false

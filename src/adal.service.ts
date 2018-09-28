@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 
-import { Observable, bindCallback, timer } from 'rxjs';
-import { map } from 'rxjs/operators';
+import { bindCallback, Observable, Subscription, throwError, timer } from 'rxjs';
+import { catchError, take, tap } from 'rxjs/operators';
 
 import { guid } from './utilities/guid';
 import { JwtUtility } from './utilities/jwt-utilty';
@@ -9,25 +9,12 @@ import { Storage } from './storage/storage';
 import { localStorageSupported, sessionStorageSupported } from './storage/storage-helper';
 import { LocalStorage } from './storage/local.storage';
 import { SessionStorage } from './storage/session.storage';
+import { fromPromise } from 'rxjs/internal-compatibility';
+import { AdalEvents } from './event/adal.events';
+import { CONSTANTS, LOGGING_LEVEL, REQUEST_TYPE, RESPONSE_TYPE, STORAGE_CONSTANTS, TOKEN_TYPE } from './constants';
+import { deepCopy } from './utilities/deep-copy';
 
-export function deepCopy<T extends any>(value: T): T {
-    if (Array.isArray(value)) {
-        return value.map((o: T) => deepCopy(o));
-    } else if (value && typeof value === 'object') {
-        if (value['toJSON']) {
-            return JSON.parse((value['toJSON'] as () => string)());
-        }
-
-        const copy = new (Object.getPrototypeOf(value).constructor)();
-        for (const key of Object.getOwnPropertyNames(value)) {
-            copy[key] = deepCopy(value[key]);
-        }
-
-        return copy;
-    } else {
-        return value;
-    }
-}
+// tslint:disable member-ordering
 
 export interface AuthenticationContextStatic {
     new (config: Config): AuthenticationContext;
@@ -36,7 +23,6 @@ export interface AuthenticationContextStatic {
 export interface WindowWithAdalContext extends Window {
     _adalInstance?: AuthenticationContext;
     AuthenticationContext: AuthenticationContextStatic;
-    callBackMappedToRenewStates: any;
 }
 
 /**
@@ -84,6 +70,10 @@ export interface RequestInfo {
     valid: boolean;
 }
 
+export interface TokenReceivedCallbackInfo extends RequestInfo {
+    tokenType?: TOKEN_TYPE;
+}
+
 export interface UserProfile {
     sid?: string;
     upn?: string;
@@ -112,11 +102,6 @@ export interface AdalUser extends User {
     authenticated: boolean;
 }
 
-export enum TOKEN_TYPE {
-    ACCESS_TOKEN = 'access_token',
-    ID_TOKEN = 'id_token',
-}
-
 export interface TokenCallback {
     /**
      * @param {string} [errorDescription] - Error description returned from AAD if token request fails.
@@ -125,6 +110,15 @@ export interface TokenCallback {
      * @param {TOKEN_TYPE} [tokenType] - @TODO Add parameter description for tokenType
      */
     (errorDescription?: string | null, token?: string | null, error?: string | null, tokenType?: TOKEN_TYPE): void;
+}
+
+export interface TokenReceivedCallback {
+    /**
+     * @param {string} token - Token returned from AAD if token request is successful.
+     * @param {TOKEN_TYPE} tokenType - @TODO Add parameter description for tokenType
+     * @param {mixed} error - Error message returned from AAD if token request fails.
+     */
+    (token: string | null, info: TokenReceivedCallbackInfo, error: { message: string, description?: string } | null): void;
 }
 
 export interface UserCallback {
@@ -160,7 +154,7 @@ export interface Config {
      */
     endpoints?: {[key: string]: string};
     /**
-     * Set this to true to enable login in a popup winodow instead of a full redirect.Defaults to `false`.
+     * Set this to true to enable login in a popup window instead of a full redirect. Defaults to `false`.
      */
     popUp?: boolean;
     /**
@@ -217,7 +211,7 @@ export interface Config {
     /**
      * Callback to be called with token or on error.
      */
-    callback?: TokenCallback;
+    callback?: TokenReceivedCallback;
 
     slice?: string;
 
@@ -244,79 +238,9 @@ export interface InternalConfig extends Config {
     navigateToLoginRequestUrl: boolean;
     extraQueryParameter?: string;
     logOutUri?: string;
-    callback?: TokenCallback;
+    callback?: TokenReceivedCallback;
     slice?: string;
 }
-
-/**
- * Enum for request type
- * @enum {string}
- */
-export enum REQUEST_TYPE {
-    LOGIN = 'LOGIN',
-    RENEW_TOKEN = 'RENEW_TOKEN',
-    UNKNOWN = 'UNKNOWN',
-}
-
-/**
- * Enum for response type
- * @enum {string}
- */
-export enum RESPONSE_TYPE {
-    ID_TOKEN = 'id_token',
-    ID_TOKEN_TOKEN = 'id_token token',
-    TOKEN = 'token',
-}
-
-export enum LOGGING_LEVEL {
-    ERROR = 0,
-    WARNING = 1,
-    INFO = 2,
-    VERBOSE = 3,
-}
-
-/**
- * Enum for storage constants
- * @enum {string}
- */
-export const CONSTANTS = {
-    RESOURCE_DELIMETER: '|',
-    CACHE_DELIMETER: '||',
-    LOADFRAME_TIMEOUT: 6000,
-    TOKEN_RENEW_STATUS_CANCELED: 'Canceled',
-    TOKEN_RENEW_STATUS_COMPLETED: 'Completed',
-    TOKEN_RENEW_STATUS_IN_PROGRESS: 'In Progress',
-    LEVEL_STRING_MAP: {
-        0: 'ERROR:',
-        1: 'WARNING:',
-        2: 'INFO:',
-        3: 'VERBOSE:',
-    },
-    POPUP_WIDTH: 483,
-    POPUP_HEIGHT: 600,
-};
-
-/**
- * Enum for storage constants
- * @enum {string}
- */
-export const STORAGE_CONSTANTS = {
-    TOKEN_KEYS: 'adal.token.keys',
-    ACCESS_TOKEN_KEY: 'adal.access.token.key',
-    EXPIRATION_KEY: 'adal.expiration.key',
-    STATE_LOGIN: 'adal.state.login',
-    STATE_RENEW: 'adal.state.renew',
-    NONCE_IDTOKEN: 'adal.nonce.idtoken',
-    SESSION_STATE: 'adal.session.state',
-    USERNAME: 'adal.username',
-    IDTOKEN: 'adal.idtoken',
-    ERROR: 'adal.error',
-    ERROR_DESCRIPTION: 'adal.error.description',
-    LOGIN_REQUEST: 'adal.login.request',
-    LOGIN_ERROR: 'adal.login.error',
-    RENEW_STATUS: 'adal.token.renew.status',
-    ANGULAR_LOGIN_REQUEST: 'adal.angular.login.request',
-};
 
 export class AuthenticationContext {
     /**
@@ -334,7 +258,6 @@ export class AuthenticationContext {
     // public
     public instance: string = 'https://login.microsoftonline.com/';
     public config: InternalConfig;
-    public callback: TokenCallback;
     public popUp: boolean = false;
 
     // @TODO Remove eventually
@@ -346,18 +269,25 @@ export class AuthenticationContext {
 
     public readonly storage: Storage;
 
+    public readonly origin: string;
+    public readonly isPopup: boolean;
+    public readonly isIFrame: boolean;
+    public readonly isRoot: boolean;
+
     // private
     private _user: User | null = null;
     private _activeRenewals: Map<string, string> = new Map();
     private _loginInProgress: boolean = false;
     private _acquireTokenInProgress: boolean = false;
     private _renewStates: string[] = [];
-    private _callBackMappedToRenewStates: Map<string, TokenCallback> = new Map();
-    private _callBacksMappedToRenewStates: Map<string, TokenCallback[]> = new Map();
     private _openedWindows: Window[] = [];
     private _requestType: REQUEST_TYPE = REQUEST_TYPE.LOGIN;
 
     private _state: string = '';
+
+    private _promiseForExpectedState: Map<string, Promise<string>> = new Map();
+
+    private _events: AdalEvents = new AdalEvents();
 
     constructor(config: Config) {
         (window as WindowWithAdalContext)._adalInstance = this;
@@ -375,9 +305,31 @@ export class AuthenticationContext {
             throw new Error('clientId is required');
         }
 
-        const configClone = deepCopy(config) as InternalConfig;
+        this.origin = window.location.protocol + '//' + window.location.host;
+        this.isPopup = (window.opener && !!((window.opener as WindowWithAdalContext)._adalInstance));
+        this.isIFrame = (window.parent && window.parent !== window && !!((window.parent as WindowWithAdalContext)._adalInstance));
+        this.isRoot = (!this.isPopup && ! this.isIFrame);
 
-        this.callback = () => {}; // tslint:disable-line no-empty
+        if (!this.isRoot) {
+            console.info('I am in an iFrame :)');
+            window.parent.postMessage({
+                    type: 'AdalTokenRefresh',
+                    data: {
+                        message: 'This is a *secure* message from the iFrame :D ',
+                    },
+                },
+                this.origin
+            );
+        } else {
+            console.info('I am in the root window :)');
+            window.addEventListener('message', (event: MessageEvent) => {
+                if (event.origin === this.origin && event.data && event.data.type === 'AdalTokenRefresh') {
+                    console.info('Received message event: ', event.data, event);
+                }
+            }, false);
+        }
+
+        const configClone = deepCopy(config) as InternalConfig;
 
         this.storage = this.getStorageImplementation(configClone);
 
@@ -390,7 +342,7 @@ export class AuthenticationContext {
         }
 
         if (config.callback && typeof config.callback === 'function') {
-            this.callback = config.callback;
+            this.onTokenReceived(config.callback);
         }
 
         if (config.instance) {
@@ -428,6 +380,10 @@ export class AuthenticationContext {
         this.config = configClone;
     }
 
+    public onTokenReceived(callback: TokenReceivedCallback): () => void {
+        return this._events.on('tokenReceived', callback);
+    }
+
     /**
      * Initiates the login process by redirecting the user to Azure AD authorization endpoint.
      */
@@ -452,7 +408,7 @@ export class AuthenticationContext {
             this.storage.set(this.STORAGE_CONSTANTS.ANGULAR_LOGIN_REQUEST, '');
         }
 
-        this.verbose('Expected state: ' + expectedState + ' startPage:' + loginStartPage);
+        this.verbose('Expected state: ' + expectedState + ', startPage: ' + loginStartPage);
         this.storage.set(this.STORAGE_CONSTANTS.LOGIN_REQUEST, loginStartPage);
         this.storage.set(this.STORAGE_CONSTANTS.LOGIN_ERROR, '');
         const existingLoginState = this.storage.get(this.STORAGE_CONSTANTS.STATE_LOGIN) || '';
@@ -470,11 +426,11 @@ export class AuthenticationContext {
         } else if (this.popUp) {
             this.storage.set(this.STORAGE_CONSTANTS.STATE_LOGIN, ''); // so requestInfo does not match redirect case
             this._renewStates.push(expectedState);
-            this.registerCallback(expectedState, this.config.clientId, this.callback);
+            this.registerCallback(expectedState, this.config.clientId/*, this.callback*/);
             this._loginPopup(urlNavigate);
 
         } else {
-            this.promptUser(urlNavigate);
+            this.redirectToUrl(urlNavigate);
         }
     }
 
@@ -538,7 +494,7 @@ export class AuthenticationContext {
      */
     protected _loginPopup(urlNavigate: string, resource?: string, callback?: TokenCallback): void {
         const popupWindow = this._openPopup(urlNavigate, 'login', this.CONSTANTS.POPUP_WIDTH, this.CONSTANTS.POPUP_HEIGHT);
-        const loginCallback = callback || this.callback;
+        const loginCallback = callback;
 
         if (popupWindow == null) {
             const error = 'Error opening popup';
@@ -687,50 +643,83 @@ export class AuthenticationContext {
         return user;
     }
 
+    protected getActiveRenewalForResource(resource: string): string | undefined {
+        return this._activeRenewals.get(resource);
+    }
+
+    /**
+     * Returns a promise for when the given resource completes the token renewal.
+     *
+     * @param {string} resource  -  A URI that identifies the resource for which the token is requested.
+     * @param {string} expectedState  -  A unique identifier (guid).
+     */
+    protected registerStateCallback(resource: string, expectedState: string): Promise<string> {
+        this._activeRenewals.set(resource, expectedState);
+
+        let promise = this._promiseForExpectedState.get(expectedState);
+        if (!promise) {
+            promise = new Promise<string>((resolve, reject) => {
+                const unbind = this._events.on<TokenReceivedCallback>('tokenReceived', (token, info, error) => {
+                    if (resource === this.config.clientId) {
+                        if (info.requestType === REQUEST_TYPE.LOGIN) {
+                            unbind();
+                            if (!error) {
+                                resolve(token!);
+                            } else {
+                                reject(error.message);
+                            }
+                            this._promiseForExpectedState.delete(expectedState);
+                            this._activeRenewals.delete(resource);
+                        }
+                    } else {
+                        if (info.requestType === REQUEST_TYPE.RENEW_TOKEN && info.parameters.state === expectedState) {
+                            unbind();
+                            if (!error) {
+                                resolve(token!);
+                            } else {
+                                reject(error.message);
+                            }
+                            this._promiseForExpectedState.delete(expectedState);
+                            this._activeRenewals.delete(resource);
+                        }
+                    }
+                });
+            });
+            this._promiseForExpectedState.set(expectedState, promise);
+        }
+
+        return promise;
+    }
+
     /**
      * Adds the passed callback to the array of callbacks for the specified resource and puts the array on the window object.
      *
      * @param {string} resource  -  A URI that identifies the resource for which the token is requested.
      * @param {string} expectedState  -  A unique identifier (guid).
      * @param {TokenCallback} callback  -  The callback provided by the caller. It will be called with token or error.
+     * @deprecated
      */
-    public registerCallback(expectedState: string, resource: string, callback: TokenCallback): void {
-        this._activeRenewals.set(resource, expectedState);
-
-        let callbacks = this._callBacksMappedToRenewStates.get(expectedState);
-        if (!callbacks) {
-            callbacks = [];
-            this._callBacksMappedToRenewStates.set(expectedState, callbacks);
-        }
-        callbacks.push(callback);
-
-        if (!this._callBackMappedToRenewStates.has(expectedState)) {
-            this._callBackMappedToRenewStates.set(expectedState, (errorDescription?: string | null, token?: string | null, error?: string | null, tokenType?: TOKEN_TYPE) => {
-                this._activeRenewals.delete(resource);
-
-                const renewStateCallbacks = this._callBacksMappedToRenewStates.get(expectedState) || [];
-                for (let i = 0; i < renewStateCallbacks.length; i += 1) {
-                    try {
-                        renewStateCallbacks[i](errorDescription, token, error, tokenType);
-                    } catch (error) {
-                        this.warn(error);
-                    }
-                }
-
-                this._callBacksMappedToRenewStates.delete(expectedState);
-                this._callBackMappedToRenewStates.delete(expectedState);
-            });
-        }
+    public registerCallback(expectedState: string, resource: string, callback?: TokenCallback): Promise<string> {
+        return Promise.reject('DO NOT CALL THIS');
     }
 
     /**
      * Acquires access token with hidden iframe
      */
-    protected _renewToken(resource: string, callback: TokenCallback, responseType?: RESPONSE_TYPE): void {
+    protected _renewToken(resource: string, responseType?: RESPONSE_TYPE): Promise<any> {
+        // Already renewing for this resource, callback when we get the token.
+        const activeRenewal = this.getActiveRenewalForResource(resource);
+        if (activeRenewal) {
+            // Active renewals contains the state for each renewal.
+            return this.registerStateCallback(activeRenewal, resource);
+        }
+
         // use iframe to try to renew token
-        // use given resource to create new authz url
-        this.info('renewToken is called for resource:' + resource);
-        const frameHandle = this._addAdalFrame('adalRenewFrame' + resource);
+        // use given resource to create new auth url
+        this.info('renewToken is called for resource: ' + resource);
+
+        const frameName = 'adalRenewFrameFor' + resource;
+        const frameHandle = this._addAdalFrame(frameName);
         const expectedState = guid() + '|' + resource;
 
         this._state = expectedState;
@@ -752,20 +741,30 @@ export class AuthenticationContext {
         urlNavigate = urlNavigate + '&prompt=none';
         urlNavigate = this._addHintParameters(urlNavigate);
 
-        this.registerCallback(expectedState, resource, callback);
-        this.verbosePii('Navigate to:' + urlNavigate);
+        const promise = this.registerStateCallback(expectedState, resource);
+        this.verbosePii('Navigate to: ' + urlNavigate);
         frameHandle.src = 'about:blank';
 
-        this._loadFrameTimeout(urlNavigate, 'adalRenewFrame' + resource, resource);
+        this._loadFrameTimeout(urlNavigate, frameName, resource, REQUEST_TYPE.RENEW_TOKEN);
+
+        return promise;
     }
 
     /**
      * Renews idtoken for app's own backend when resource is clientId and calls the callback with token/error
      */
-    protected _renewIdToken(callback: TokenCallback, responseType?: RESPONSE_TYPE): void {
+    protected _renewIdToken(responseType?: RESPONSE_TYPE): Promise<string> {
+        // Already renewing for this resource, callback when we get the token.
+        const activeRenewal = this.getActiveRenewalForResource(this.config.clientId);
+        if (activeRenewal) {
+            // Active renewals contains the state for each renewal.
+            return this.registerStateCallback(activeRenewal, this.config.clientId);
+        }
+
         // use iframe to try to renew token
         this.info('renewIdToken is called');
-        const frameHandle = this._addAdalFrame('adalIdTokenFrame');
+        const frameId = 'adalIdTokenFrame';
+        const frameHandle = this._addAdalFrame(frameId);
         const expectedState = guid() + '|' + this.config.clientId;
 
         const idTokenNonce = guid();
@@ -786,11 +785,13 @@ export class AuthenticationContext {
         urlNavigate = this._addHintParameters(urlNavigate);
         urlNavigate += '&nonce=' + encodeURIComponent(idTokenNonce);
 
-        this.registerCallback(expectedState, this.config.clientId, callback);
-        this.verbosePii('Navigate to:' + urlNavigate);
+        const promise = this.registerStateCallback(expectedState, this.config.clientId);
+        this.verbosePii('Navigate to: ' + urlNavigate);
         frameHandle.src = 'about:blank';
 
-        this._loadFrameTimeout(urlNavigate, 'adalIdTokenFrame', this.config.clientId);
+        this._loadFrameTimeout(urlNavigate, frameId, this.config.clientId, REQUEST_TYPE.LOGIN);
+
+        return promise;
     }
 
     /**
@@ -825,7 +826,7 @@ export class AuthenticationContext {
      * Calling _loadFrame but with a timeout to signal failure in loadframeStatus. Callbacks are left
      * registered when network errors occur and subsequent token requests for same resource are registered to the pending request
      */
-    protected _loadFrameTimeout(urlNavigation: string, frameName: string, resource: string): void {
+    protected _loadFrameTimeout(urlNavigation: string, frameName: string, resource: string, requestType: REQUEST_TYPE): void {
         // Set iframe session to pending
         this.verbose('Set loading state to pending for: ' + resource);
         this.storage.set(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_IN_PROGRESS);
@@ -835,13 +836,20 @@ export class AuthenticationContext {
             if (this.storage.get(this.STORAGE_CONSTANTS.RENEW_STATUS + resource) === this.CONSTANTS.TOKEN_RENEW_STATUS_IN_PROGRESS) {
                 // fail the iframe session if it's in pending state
                 this.verbose('Loading frame has timed out after: ' + (this.CONSTANTS.LOADFRAME_TIMEOUT / 1000) + ' seconds for resource ' + resource);
-                const expectedState = this._activeRenewals.get(resource);
+                const expectedState = this.getActiveRenewalForResource(resource);
 
                 if (expectedState) {
-                    const callback = this._callBackMappedToRenewStates.get(expectedState);
-                    if (callback) {
-                        callback('Token renewal operation failed due to timeout', null, 'Token Renewal Failed');
-                    }
+                    const info: TokenReceivedCallbackInfo = Object.create(null);
+                    info.requestType = requestType;
+                    info.parameters = {
+                        state: expectedState,
+                    };
+
+                    const error = Object.create(null);
+                    error.message = 'Token Renewal Failed';
+                    error.description = 'Token renewal operation failed due to timeout';
+
+                    this._events.emit('tokenReceived', null, info, error);
                 }
 
                 this.storage.set(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_CANCELED);
@@ -873,64 +881,66 @@ export class AuthenticationContext {
      * Acquires token from the cache if it is not expired. Otherwise sends request to AAD to obtain a new token.
      *
      * @param {string} resource  -  ResourceUri identifying the target resource
-     * @param {TokenCallback} callback  -  The callback provided by the caller. It will be called with token or error.
      */
-    public acquireToken(resource: string, callback: TokenCallback): void {
-        if (!resource) {
-            this.warn('resource is required');
-            callback('resource is required', null, 'resource is required');
+    public acquireToken(resource: string): Promise<string> {
+        let errorMessage: string;
 
-            return;
+        if (!resource) {
+            errorMessage = 'Resource is required';
+            this.warn(errorMessage);
+
+            return Promise.reject(errorMessage);
         }
 
         const token = this.getCachedToken(resource);
 
         if (token) {
-            this.info('Token is already in cache for resource:' + resource);
-            callback(null, token, null);
+            this.info('Token is already in cache for resource: ' + resource);
 
-            return;
+            Promise.resolve(token);
+        }
+
+        if (!this.isRoot) {
+            errorMessage = 'Can not acquire token from iFrame';
+            this.warn(errorMessage);
+
+            return Promise.reject(errorMessage);
         }
 
         if (!this._user && !(this.config.extraQueryParameter && this.config.extraQueryParameter.indexOf('login_hint') !== -1)) {
-            this.warn('User login is required');
-            callback('User login is required', null, 'login required');
+            errorMessage = 'User login is required';
+            this.warn(errorMessage);
 
-            return;
+            return Promise.reject(errorMessage);
         }
 
         // renew attempt with iframe
-        // Already renewing for this resource, callback when we get the token.
-        const activeRenewal = this._activeRenewals.get(resource);
-        if (activeRenewal) {
-            // Active renewals contains the state for each renewal.
-            this.registerCallback(activeRenewal, resource, callback);
-
-        } else {
-            this._requestType = REQUEST_TYPE.RENEW_TOKEN;
-            if (resource === this.config.clientId) {
-                // App uses idtoken to send to api endpoints
-                // Default resource is tracked as clientid to store this token
-                if (this._user) {
-                    this.verbose('renewing idtoken');
-                    this._renewIdToken(callback);
-
-                } else {
-                    this.verbose('renewing idtoken and access_token');
-                    this._renewIdToken(callback, this.RESPONSE_TYPE.ID_TOKEN_TOKEN);
-                }
+        this._requestType = REQUEST_TYPE.RENEW_TOKEN;
+        let promise;
+        if (resource === this.config.clientId) {
+            // App uses idToken to send to api endpoints
+            // Default resource is tracked as clientId to store this token
+            if (this._user) {
+                this.verbose('renewing idtoken');
+                promise = this._renewIdToken();
 
             } else {
-                if (this._user) {
-                    this.verbose('renewing access_token');
-                    this._renewToken(resource, callback);
+                this.verbose('renewing idtoken and access_token');
+                promise = this._renewIdToken(this.RESPONSE_TYPE.ID_TOKEN_TOKEN);
+            }
 
-                } else {
-                    this.verbose('renewing idtoken and access_token');
-                    this._renewToken(resource, callback, this.RESPONSE_TYPE.ID_TOKEN_TOKEN);
-                }
+        } else {
+            if (this._user) {
+                this.verbose('renewing access_token');
+                promise = this._renewToken(resource);
+
+            } else {
+                this.verbose('renewing idtoken and access_token');
+                promise = this._renewToken(resource, this.RESPONSE_TYPE.ID_TOKEN_TOKEN);
             }
         }
+
+        return promise;
     }
 
     /**
@@ -941,26 +951,33 @@ export class AuthenticationContext {
      * @param {string} claims - @TODO Add parameter description for claims
      * @param {TokenCallback} callback - The callback provided by the caller. It will be called with token or error.
      */
-    public acquireTokenPopup(resource: string, extraQueryParameters: string, claims: string, callback: TokenCallback): void {
+    public acquireTokenPopup(resource: string, extraQueryParameters: string, claims: string, callback: TokenCallback): Promise<string> {
         if (!resource) {
             this.warn('resource is required');
             callback('resource is required', null, 'resource is required');
 
-            return;
+            return Promise.reject('Resource is required');
+        }
+
+        if (!this.isRoot) {
+            this.warn('Can not acquire token from iFrame');
+            callback('Can not acquire token from iFrame', null, 'Can not acquire token from iFrame');
+
+            return Promise.reject('Can not acquire token from iFrame');
         }
 
         if (!this._user) {
             this.warn('User login is required');
             callback('User login is required', null, 'login required');
 
-            return;
+            return Promise.reject('User login is required');
         }
 
         if (this._acquireTokenInProgress) {
             this.warn('Acquire token interactive is already in progress');
             callback('Acquire token interactive is already in progress', null, 'Acquire token interactive is already in progress');
 
-            return;
+            return Promise.reject('Acquire token interactive is already in progress');
         }
 
         const expectedState = guid() + '|' + resource;
@@ -986,8 +1003,10 @@ export class AuthenticationContext {
         urlNavigate = this._addHintParameters(urlNavigate);
         this._acquireTokenInProgress = true;
         this.info('acquireToken interactive is called for the resource ' + resource);
-        this.registerCallback(expectedState, resource, callback);
+        const promise = this.registerCallback(expectedState, resource, callback);
         this._loginPopup(urlNavigate, resource, callback);
+
+        return promise;
     }
 
     /**
@@ -998,26 +1017,53 @@ export class AuthenticationContext {
      * @param {string} extraQueryParameters - Extra query parameters to add to the authentication request
      * @param {string} claims - @TODO Add parameter description for claims
      */
-    public acquireTokenRedirect(resource: string, extraQueryParameters: string, claims: string): void {
-        if (!resource) {
-            this.warn('resource is required');
-            this.callback('resource is required', null, 'resource is required');
+    public acquireTokenRedirect(resource: string, extraQueryParameters: string, claims: string): Promise<string> {
+        const token: string | null = null;
+        const info: TokenReceivedCallbackInfo = Object.create(null);
+        const error: {message: string, description?: string} = Object.create(null);
+        let errorMessage: string;
+        // let errorDescription: string;
 
-            return;
+        if (!resource) {
+            errorMessage = 'Resource is required';
+
+            this.warn(errorMessage);
+
+            error.message = errorMessage;
+            this._events.emit('tokenReceived', token, info, error);
+
+            return Promise.reject(errorMessage);
+        }
+
+        if (!this.isRoot) {
+            errorMessage = 'Can not acquire token from iFrame';
+
+            this.warn(errorMessage);
+
+            error.message = errorMessage;
+            this._events.emit('tokenReceived', token, info, error);
+
+            return Promise.reject('Can not acquire token from iFrame');
         }
 
         if (!this._user) {
-            this.warn('User login is required');
-            this.callback('User login is required', null, 'login required');
+            errorMessage = 'User login is required';
+            this.warn(errorMessage);
 
-            return;
+            error.message = errorMessage;
+            this._events.emit('tokenReceived', token, info, error);
+
+            return Promise.reject(errorMessage);
         }
 
         if (this._acquireTokenInProgress) {
-            this.warn('Acquire token interactive is already in progress');
-            this.callback('Acquire token interactive is already in progress', null, 'Acquire token interactive is already in progress');
+            errorMessage = 'Acquire token interactive is already in progress';
+            this.warn(errorMessage);
 
-            return;
+            error.message = errorMessage;
+            this._events.emit('tokenReceived', token, info, error);
+
+            return Promise.reject(errorMessage);
         }
 
         const expectedState = guid() + '|' + resource;
@@ -1044,7 +1090,9 @@ export class AuthenticationContext {
         this.storage.set(this.STORAGE_CONSTANTS.LOGIN_REQUEST, window.location.href);
         const existingState = this.storage.get(this.STORAGE_CONSTANTS.STATE_RENEW) || '';
         this.storage.set(this.STORAGE_CONSTANTS.STATE_RENEW, existingState + expectedState + this.CONSTANTS.CACHE_DELIMETER);
-        this.promptUser(urlNavigate);
+        this.redirectToUrl(urlNavigate);
+
+        return Promise.resolve('');
     }
 
     /**
@@ -1052,9 +1100,9 @@ export class AuthenticationContext {
      *
      * @param {string} urlNavigate  -  Url of the authorization endpoint.
      */
-    public promptUser(urlNavigate: string): void {
+    public redirectToUrl(urlNavigate: string): void {
         if (urlNavigate) {
-            this.infoPii('Navigate to:' + urlNavigate);
+            this.infoPii('Navigate to: ' + urlNavigate);
             window.location.replace(urlNavigate);
         } else {
             this.info('Navigate url is empty');
@@ -1132,7 +1180,7 @@ export class AuthenticationContext {
         }
 
         this.infoPii('Logout navigate to: ' + urlNavigate);
-        this.promptUser(urlNavigate);
+        this.redirectToUrl(urlNavigate);
     }
 
     /**
@@ -1268,6 +1316,18 @@ export class AuthenticationContext {
             || parameters.access_token !== undefined
             || parameters.id_token !== undefined
         );
+    }
+
+    public getClosestInstance(): AuthenticationContext {
+        if (this.isRoot) {
+            return this;
+        }
+
+        if (this.isPopup) {
+            return (window.opener as WindowWithAdalContext)._adalInstance!;
+        }
+
+        return (window.parent as WindowWithAdalContext)._adalInstance!;
     }
 
     /**
@@ -1415,7 +1475,7 @@ export class AuthenticationContext {
      * @param {RequestInfo} requestInfo
      */
     public saveTokenFromHash(requestInfo: RequestInfo): void {
-        this.info('State status:' + requestInfo.stateMatch + '; Request type:' + requestInfo.requestType);
+        this.info('State status: ' + requestInfo.stateMatch + '; Request type: ' + requestInfo.requestType);
         this.storage.set(this.STORAGE_CONSTANTS.ERROR, '');
         this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
 
@@ -1423,7 +1483,7 @@ export class AuthenticationContext {
 
         // Record error
         if (requestInfo.parameters.error_description !== undefined) {
-            this.infoPii('Error :' + requestInfo.parameters.error + '; Error description:' + requestInfo.parameters.error_description);
+            this.infoPii('Error: ' + requestInfo.parameters.error + '; Error description: ' + requestInfo.parameters.error_description);
             this.storage.set(this.STORAGE_CONSTANTS.ERROR, requestInfo.parameters.error || '');
             this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, requestInfo.parameters.error_description);
 
@@ -1431,6 +1491,20 @@ export class AuthenticationContext {
                 this._loginInProgress = false;
                 this.storage.set(this.STORAGE_CONSTANTS.LOGIN_ERROR, requestInfo.parameters.error_description);
             }
+
+            // window.parent.postMessage({
+            //     type: 'AdalTokenRefresh',
+            //     data: {
+            //       isError: true,
+            //       resource: resource,
+            //       requestType: requestInfo.requestType,
+            //       error: requestInfo.parameters.error || '',
+            //       errorDescription: requestInfo.parameters.error_description,
+            //     },
+            //   },
+            //   this.origin
+            // );
+
         } else {
             // It must verify the state from redirect
             if (requestInfo.stateMatch) {
@@ -1482,9 +1556,9 @@ export class AuthenticationContext {
                                 this.storage.set(this.STORAGE_CONSTANTS.TOKEN_KEYS, keys + idTokenResource + this.CONSTANTS.RESOURCE_DELIMETER);
                             }
 
-                            // this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters[this.CONSTANTS.ID_TOKEN]);
-                            this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + idTokenResource, this._user.profile.exp || '');
-                            // this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters[this.CONSTANTS.ID_TOKEN]);
+                            // this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + resource, requestInfo.parameters.id_token);
+                            this.storage.set(this.STORAGE_CONSTANTS.ACCESS_TOKEN_KEY + idTokenResource, requestInfo.parameters.id_token);
+                            // this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + resource, this._user.profile.exp || '');
                             this.storage.set(this.STORAGE_CONSTANTS.EXPIRATION_KEY + idTokenResource, this._user.profile.exp || '');
                         }
 
@@ -1566,7 +1640,7 @@ export class AuthenticationContext {
      *
      * @param {string} [hash=window.location.hash] - Hash fragment of Url.
      */
-    public handleWindowCallback(hash?: string): void {
+    public handleWindowCallback(hash?: string, noLocationChange: boolean = false, noHashChange: boolean = false): RequestInfo | null {
         // This is for regular javascript usage for redirect handling
         // need to make sure this is for callback
         if (null == hash) {
@@ -1574,37 +1648,34 @@ export class AuthenticationContext {
         }
 
         if (this.isCallback(hash)) {
-            let self: AuthenticationContext = null as any;
-            let isPopup = false;
+            this.verbose('Getting closest AuthenticationContext...');
+            const self: AuthenticationContext = this.getClosestInstance();
+            self.verbose('...done!');
 
-            if (
-                this._openedWindows.length > 0
-                && this._openedWindows[this._openedWindows.length - 1].opener
-                && this._openedWindows[this._openedWindows.length - 1].opener._adalInstance
-            ) {
-                self = this._openedWindows[this._openedWindows.length - 1].opener._adalInstance;
-                isPopup = true;
-
-            } else if (window.parent && (window.parent as WindowWithAdalContext)._adalInstance) {
-                self = (window.parent as WindowWithAdalContext)._adalInstance!;
-            }
+            // let isPopup = false;
+            // if (
+            //     this._openedWindows.length > 0
+            //     && this._openedWindows[this._openedWindows.length - 1].opener
+            //     && this._openedWindows[this._openedWindows.length - 1].opener._adalInstance
+            // ) {
+            //     self = this._openedWindows[this._openedWindows.length - 1].opener._adalInstance;
+            //     isPopup = true;
+            //
+            // } else if (window.parent && (window.parent as WindowWithAdalContext)._adalInstance) {
+            //     self = (window.parent as WindowWithAdalContext)._adalInstance!;
+            // }
 
             const requestInfo = self.getRequestInfo(hash);
             let token;
-            let tokenReceivedCallback;
             let tokenType: TOKEN_TYPE | undefined;
-
-            if (isPopup || window.parent !== window) {
-                tokenReceivedCallback = self._callBackMappedToRenewStates.get(requestInfo.stateResponse);
-            } else {
-                tokenReceivedCallback = self.callback;
-            }
 
             self.info('Returned from redirect url');
             self.saveTokenFromHash(requestInfo);
 
-            if ((requestInfo.requestType === REQUEST_TYPE.RENEW_TOKEN) && window.parent) {
-                if (window.parent !== window) {
+            const errorMessage = requestInfo.parameters.error_description || requestInfo.parameters.error;
+
+            if (requestInfo.requestType === REQUEST_TYPE.RENEW_TOKEN) {
+                if (!this.isRoot) {
                     self.verbose('Window is in iframe, acquiring token silently');
                 } else {
                     self.verbose('acquiring token interactive in progress');
@@ -1613,30 +1684,65 @@ export class AuthenticationContext {
                 token = requestInfo.parameters.access_token || requestInfo.parameters.id_token;
                 tokenType = TOKEN_TYPE.ACCESS_TOKEN;
 
+                if (errorMessage) {
+                    self._events.emit('renewTokenError', errorMessage, requestInfo.parameters.state, requestInfo.requestType);
+                } else {
+                    self._events.emit('renewTokenSuccess', token, requestInfo.parameters.state, requestInfo.requestType);
+                }
+
             } else if (requestInfo.requestType === REQUEST_TYPE.LOGIN) {
                 token = requestInfo.parameters.id_token;
                 tokenType = TOKEN_TYPE.ID_TOKEN;
+
+                if (errorMessage) {
+                    self._events.emit('renewIdTokenError', errorMessage);
+                } else {
+                    self._events.emit('renewIdTokenSuccess', token);
+                }
             }
 
             const errorDesc = requestInfo.parameters.error_description;
             const error = requestInfo.parameters.error;
-            try {
-                if (tokenReceivedCallback) {
-                    tokenReceivedCallback(errorDesc, token, error, tokenType);
-                }
 
-            } catch (err) {
-                self.error('Error occurred in user defined callback function: ' + err);
+            const info = Object.create(null);
+            info.tokenType = tokenType;
+            info.parameters = requestInfo.parameters;
+            info.requestType = requestInfo.requestType;
+            info.stateMatch = requestInfo.stateMatch;
+            info.stateResponse = requestInfo.stateResponse;
+            info.valid = requestInfo.valid;
+
+            let errorObject = null;
+            if (error || errorDesc) {
+                errorObject = Object.create(null);
+                errorObject.message = error || errorDesc;
+                if (error && errorDesc) {
+                    errorObject.description = errorDesc;
+                }
             }
 
-            if (window.parent === window && !isPopup) {
+            this._events.emit('tokenReceived', token || null, info, errorObject);
+
+            if (this.isRoot) {
                 if (self.config.navigateToLoginRequestUrl) {
-                    window.location.href = self.storage.get(self.STORAGE_CONSTANTS.LOGIN_REQUEST)!;
+                    if (!noLocationChange) {
+                        window.location.href = self.storage.get(self.STORAGE_CONSTANTS.LOGIN_REQUEST)!;
+                    }
                 } else {
-                    window.location.hash = '';
+                    if (!noHashChange) {
+                        window.history.replaceState(
+                            '',
+                            document.title,
+                            window.location.pathname + window.location.search
+                        );
+                    }
                 }
             }
+
+            return requestInfo;
         }
+
+        return null;
     }
 
     /**
@@ -1650,7 +1756,7 @@ export class AuthenticationContext {
             + '/oauth2/authorize'
             + this._serialize(responseType, this.config, resource)
             + this._addLibMetadata();
-        this.info('Navigate url:' + urlNavigate);
+        this.info('Navigate url: ' + urlNavigate);
 
         return urlNavigate;
     }
@@ -1734,7 +1840,7 @@ export class AuthenticationContext {
      * Adds the hidden iframe for silent token renewal
      */
     protected _addAdalFrame(iframeId: string): HTMLIFrameElement {
-        this.info('Add adal frame to document:' + iframeId);
+        this.info('Add adal frame to document: ' + iframeId);
         const adalFrame = document.getElementById(iframeId) as HTMLIFrameElement;
 
         if (!adalFrame) {
@@ -1800,36 +1906,6 @@ export class AuthenticationContext {
     }
 
     /**
-     * Returns true if browser supports localStorage, false otherwise.
-     */
-    protected _supportsLocalStorage(): boolean {
-        const test = 'adalStorageTest';
-        try {
-            window.localStorage.setItem(test, test);
-            window.localStorage.removeItem(test);
-
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    /**
-     * Returns true if browser supports sessionStorage, false otherwise.
-     */
-    protected _supportsSessionStorage(): boolean {
-        const test = 'adalStorageTest';
-        try {
-            window.sessionStorage.setItem(test, test);
-            window.sessionStorage.removeItem(test);
-
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    /**
      * Adds the library version and returns it.
      */
     protected _addLibMetadata(): string {
@@ -1843,7 +1919,8 @@ export class AuthenticationContext {
      *
      * @param {LOGGING_LEVEL} level  -  Level can be set 0,1,2 and 3 which turns on 'error', 'warning', 'info' or 'verbose' level logging respectively.
      * @param {string} message  -  Message to log.
-     * @param {string | Error} error  -  Error to log.
+     * @param {string | Error} [error]  -  Error to log.
+     * @param {boolean} [containsPii]  -  Set to true if logged data contains Personally Identifiable Information (PII) or Organizational Identifiable Information (OII)
      */
     public log(level: LOGGING_LEVEL, message: string, error?: string | Error, containsPii?: boolean): void {
         if (level <= Logging.level) {
@@ -1852,15 +1929,22 @@ export class AuthenticationContext {
                 return;
             }
 
-            const timestamp = (new Date()).toUTCString();
+            const timestamp = (new Date()).toISOString();
             let formattedMessage = '';
 
             const levelStr = (this.CONSTANTS.LEVEL_STRING_MAP as any)[level];
 
+            let type = 'root';
+            if (this.isIFrame) {
+                type = 'iFrame';
+            } else if (this.isPopup) {
+                type = 'popUp';
+            }
+
             if (this.config.correlationId) {
-                formattedMessage = timestamp + ':' + this.config.correlationId + '-' + AuthenticationContext.VERSION + '-' + levelStr + ' ' + message;
+                formattedMessage = timestamp + ': (' + type + ') ' + this.config.correlationId + '-' + AuthenticationContext.VERSION + '-' + levelStr + ' ' + message;
             } else {
-                formattedMessage = timestamp + ':' + AuthenticationContext.VERSION + '-' + levelStr + ' ' + message;
+                formattedMessage = timestamp + ': (' + type + ') ' + AuthenticationContext.VERSION + '-' + levelStr + ' ' + message;
             }
 
             if (error) {
@@ -1948,7 +2032,7 @@ export class AuthenticationContext {
 export class AdalService {
 
     private context: AuthenticationContext = null as any;
-    private loginRefreshTimer = null as any;
+    private loginRefreshTimer: Subscription = null as any;
 
     private user: AdalUser = {
         authenticated: false,
@@ -1981,6 +2065,17 @@ export class AdalService {
         this.context = new AuthenticationContext(configOptions);
 
         (window as WindowWithAdalContext).AuthenticationContext = this.context.constructor as AuthenticationContextStatic;
+
+        this.context.onTokenReceived((token: string | null, info: TokenReceivedCallbackInfo, error: { message: string, description?: string } | null) => {
+            console.info('onTokenReceived', token, info, error);
+
+            if (this.context.isRoot) {
+                if (info.requestType === REQUEST_TYPE.LOGIN) {
+                    this.updateDataFromCache();
+                    this.setupLoginTokenRefreshTimer();
+                }
+            }
+        });
 
         // loginresource is used to set authenticated status
 
@@ -2020,42 +2115,12 @@ export class AdalService {
      * or saves error in case unsuccessful login.
      */
     public handleWindowCallback(): void {
-        const hash = window.location.hash;
-        if (this.context.isCallback(hash)) {
-            const requestInfo = this.context.getRequestInfo(hash);
-            this.context.saveTokenFromHash(requestInfo);
+        const requestInfo = this.context.handleWindowCallback();
 
+        if (requestInfo && this.context.isRoot) {
             if (requestInfo.requestType === REQUEST_TYPE.LOGIN) {
                 this.updateDataFromCache();
                 this.setupLoginTokenRefreshTimer();
-            } else if (requestInfo.requestType === REQUEST_TYPE.RENEW_TOKEN) {
-                this.context.callback = (window.parent as WindowWithAdalContext).callBackMappedToRenewStates[requestInfo.stateResponse];
-            }
-
-            if (requestInfo.stateMatch) {
-                if (typeof this.context.callback === 'function') {
-                    if (requestInfo.requestType === REQUEST_TYPE.RENEW_TOKEN) {
-                        // Idtoken or Accestoken can be renewed
-                        if (requestInfo.parameters['access_token']) {
-                            this.context.callback(this.context.storage.get(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION)
-                                , requestInfo.parameters['access_token']);
-                        } else if (requestInfo.parameters['id_token']) {
-                            this.context.callback(this.context.storage.get(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION)
-                                , requestInfo.parameters['id_token']);
-                        } else if (requestInfo.parameters['error']) {
-                            this.context.callback(this.context.storage.get(this.context.STORAGE_CONSTANTS.ERROR_DESCRIPTION), null);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Remove hash from url
-        if (window.location.hash) {
-            if (window.history.replaceState) {
-                window.history.replaceState('', '/', window.location.pathname);
-            } else {
-                window.location.hash = '';
             }
         }
     }
@@ -2065,23 +2130,19 @@ export class AdalService {
     }
 
     public acquireToken(resource: string): Observable<string | null> {
-        return bindCallback<string | null, string | null>((callback) => {
-            this.context.acquireToken(resource, (errorDescription?: string | null, token?: string | null) => {
-                if (errorDescription) {
-                    this.context.error('Error when acquiring token for resource: ' + resource, errorDescription);
-                    callback(null, errorDescription);
-                } else {
-                    callback(token || null, null);
-                }
-            });
-        })()
-            .pipe<string | null>(
-                map((result) => {
-                    if (!result[0] && result[1]) {
-                        throw (result[1]);
-                    }
-
-                    return result[0];
+        return fromPromise(this.context.acquireToken(resource))
+            .pipe(
+                tap(() => {
+                    console.info('TESTING acquireToken promise success');
+                }, () => {
+                    console.info('TESTING acquireToken promise ERROR');
+                }),
+                catchError((error) => throwError('Error when acquiring token for resource "' + resource + '": ' + error)),
+                take(1),
+                tap((token) => {
+                    console.info('TESTING acquireToken promise success', token);
+                }, (error) => {
+                    console.info('TESTING acquireToken promise ERROR', error);
                 })
             );
     }
@@ -2131,7 +2192,7 @@ export class AdalService {
 
     private updateDataFromCache(): void {
         const token = this.context.getCachedToken(this.context.config.loginResource);
-        this.user.authenticated = token !== null && token.length > 0;
+        this.user.authenticated = (!!token);
 
         const user = this.context.getCachedUser();
 
@@ -2176,7 +2237,7 @@ export class AdalService {
     }
 
     private get isInCallbackRedirectMode(): boolean {
-      return window.location.href.indexOf('#access_token') !== -1 || window.location.href.indexOf('#id_token') !== -1;
+        return window.location.href.indexOf('#access_token') !== -1 || window.location.href.indexOf('#id_token') !== -1;
     }
 
     private setupLoginTokenRefreshTimer(): void {
