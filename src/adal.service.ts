@@ -711,7 +711,7 @@ export class AuthenticationContext {
         const activeRenewal = this.getActiveRenewalForResource(resource);
         if (activeRenewal) {
             // Active renewals contains the state for each renewal.
-            return this.registerStateCallback(activeRenewal, resource);
+            return this.registerStateCallback(resource, activeRenewal);
         }
 
         // use iframe to try to renew token
@@ -741,7 +741,7 @@ export class AuthenticationContext {
         urlNavigate = urlNavigate + '&prompt=none';
         urlNavigate = this._addHintParameters(urlNavigate);
 
-        const promise = this.registerStateCallback(expectedState, resource);
+        const promise = this.registerStateCallback(resource, expectedState);
         this.verbosePii('Navigate to: ' + urlNavigate);
         frameHandle.src = 'about:blank';
 
@@ -758,7 +758,7 @@ export class AuthenticationContext {
         const activeRenewal = this.getActiveRenewalForResource(this.config.clientId);
         if (activeRenewal) {
             // Active renewals contains the state for each renewal.
-            return this.registerStateCallback(activeRenewal, this.config.clientId);
+            return this.registerStateCallback(this.config.clientId, activeRenewal);
         }
 
         // use iframe to try to renew token
@@ -785,7 +785,7 @@ export class AuthenticationContext {
         urlNavigate = this._addHintParameters(urlNavigate);
         urlNavigate += '&nonce=' + encodeURIComponent(idTokenNonce);
 
-        const promise = this.registerStateCallback(expectedState, this.config.clientId);
+        const promise = this.registerStateCallback(this.config.clientId, expectedState);
         this.verbosePii('Navigate to: ' + urlNavigate);
         frameHandle.src = 'about:blank';
 
