@@ -1,18 +1,23 @@
+/**
+ * Makes a deep clone of the given object.
+ *
+ * @param {any} value
+ */
 export function deepCopy<T extends any>(value: T): T {
-  if (Array.isArray(value)) {
-    return value.map((o: T) => deepCopy(o));
-  } else if (value && typeof value === 'object') {
-    if (value['toJSON']) {
-      return JSON.parse((value['toJSON'] as () => string)());
-    }
+    if (Array.isArray(value)) {
+        return value.map((o: T) => deepCopy(o));
+    } else if (value && typeof value === 'object') {
+        if (value['toJSON']) {
+            return JSON.parse((value['toJSON'] as () => string)());
+        }
 
-    const copy = new (Object.getPrototypeOf(value).constructor)();
-    for (const key of Object.getOwnPropertyNames(value)) {
-      copy[key] = deepCopy(value[key]);
-    }
+        const copy = new (Object.getPrototypeOf(value).constructor)();
+        for (const key of Object.getOwnPropertyNames(value)) {
+            copy[key] = deepCopy(value[key]);
+        }
 
-    return copy;
-  } else {
-    return value;
-  }
+        return copy;
+    } else {
+        return value;
+    }
 }

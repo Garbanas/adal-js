@@ -21,7 +21,7 @@ export interface JwtPayload {
      *
      * @example https://login.microsoftonline.com/b9419818-09af-49c2-b0c3-653adc1f376e/v2.0
      */
-     iss?: string;
+    iss?: string;
 
     /**
      * Issued at

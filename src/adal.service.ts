@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 
 import { bindCallback, Observable, Subscription, throwError, timer } from 'rxjs';
-import { catchError, take, tap } from 'rxjs/operators';
+import { catchError, take } from 'rxjs/operators';
 
 import { guid } from './utilities/guid';
 import { JwtUtility } from './utilities/jwt-utilty';
@@ -13,6 +13,7 @@ import { fromPromise } from 'rxjs/internal-compatibility';
 import { AdalEvents } from './event/adal.events';
 import { CONSTANTS, LOGGING_LEVEL, REQUEST_TYPE, RESPONSE_TYPE, STORAGE_CONSTANTS, TOKEN_TYPE } from './constants';
 import { deepCopy } from './utilities/deep-copy';
+import { UrlBuilder } from './utilities/url.builder';
 
 // tslint:disable member-ordering
 
@@ -30,7 +31,7 @@ export interface WindowWithAdalContext extends Window {
  * @deprecated
  */
 declare var Logging: {
-    log: (message: string) => void;
+    log: (formattedMessage: string, originalMessage: string, level: LOGGING_LEVEL, error?: string | Error) => void;
     level: LOGGING_LEVEL;
 };
 
@@ -115,10 +116,10 @@ export interface TokenCallback {
 export interface TokenReceivedCallback {
     /**
      * @param {string} token - Token returned from AAD if token request is successful.
-     * @param {TOKEN_TYPE} tokenType - @TODO Add parameter description for tokenType
-     * @param {mixed} error - Error message returned from AAD if token request fails.
+     * @param {TokenReceivedCallbackInfo} info - Info object for the token received callback
+     * @param {any} error - Error message returned from AAD if token request fails.
      */
-    (token: string | null, info: TokenReceivedCallbackInfo, error: { message: string, description?: string } | null): void;
+    (token: string | null, info: TokenReceivedCallbackInfo, error: {message: string, description?: string} | null): void;
 }
 
 export interface UserCallback {
@@ -216,6 +217,14 @@ export interface Config {
     slice?: string;
 
     storage?: Storage;
+
+    // === Custom new ===
+    /**
+     * Whether to process the token renewals in a blocking or non-blocking way.
+     * This setting might conflict with setting the 'loadFrameTimeout'.
+     * Defaults to 'true'.
+     */
+    loadFrameAsync?: boolean;
 }
 
 export interface InternalConfig extends Config {
@@ -274,6 +283,9 @@ export class AuthenticationContext {
     public readonly isIFrame: boolean;
     public readonly isRoot: boolean;
 
+    public readonly iframeLoadTimeout: number = 6000; // Time in ms
+    public readonly iframeLoadAsync: boolean = true;
+
     // private
     private _user: User | null = null;
     private _activeRenewals: Map<string, string> = new Map();
@@ -289,9 +301,11 @@ export class AuthenticationContext {
 
     private _events: AdalEvents = new AdalEvents();
 
-    constructor(config: Config) {
-        (window as WindowWithAdalContext)._adalInstance = this;
+    private iFrameTimeouts: {[key: string]: number} = Object.create(null);
 
+    private contextInfo: string = '';
+
+    constructor(config: Config) {
         if (!config) {
             throw new Error('You must set config, when calling init.');
         }
@@ -306,12 +320,13 @@ export class AuthenticationContext {
         }
 
         this.origin = window.location.protocol + '//' + window.location.host;
-        this.isPopup = (window.opener && !!((window.opener as WindowWithAdalContext)._adalInstance));
-        this.isIFrame = (window.parent && window.parent !== window && !!((window.parent as WindowWithAdalContext)._adalInstance));
+        this.isPopup = (window.opener && (window.opener as WindowWithAdalContext)._adalInstance != null);
+        this.isIFrame = (window.parent && window.parent !== window && (window.parent as WindowWithAdalContext)._adalInstance != null);
         this.isRoot = (!this.isPopup && ! this.isIFrame);
 
+        (window as WindowWithAdalContext)._adalInstance = this;
+
         if (!this.isRoot) {
-            console.info('I am in an iFrame :)');
             window.parent.postMessage({
                     type: 'AdalTokenRefresh',
                     data: {
@@ -321,10 +336,9 @@ export class AuthenticationContext {
                 this.origin
             );
         } else {
-            console.info('I am in the root window :)');
             window.addEventListener('message', (event: MessageEvent) => {
                 if (event.origin === this.origin && event.data && event.data.type === 'AdalTokenRefresh') {
-                    console.info('Received message event: ', event.data, event);
+                    // console.info('Received message event: ', event.data, event);
                 }
             }, false);
         }
@@ -374,14 +388,48 @@ export class AuthenticationContext {
         }
 
         if (config.loadFrameTimeout) {
-            this.CONSTANTS.LOADFRAME_TIMEOUT = config.loadFrameTimeout;
+            this.iframeLoadTimeout = config.loadFrameTimeout;
+        }
+
+        if (config.loadFrameAsync) {
+            this.iframeLoadAsync = !!config.loadFrameAsync;
         }
 
         this.config = configClone;
+
+        if (this.isRoot) {
+            this.verbose('Creating new AuthenticationContext (root)');
+        }
+
+        if (this.isPopup) {
+            this.verbose('Creating new AuthenticationContext (popUp)');
+        }
+
+        if (this.isIFrame) {
+            this.verbose('Creating new AuthenticationContext (iFrame)');
+        }
     }
 
     public onTokenReceived(callback: TokenReceivedCallback): () => void {
         return this._events.on('tokenReceived', callback);
+    }
+
+    public getUrlBuilder(): UrlBuilder {
+        return new UrlBuilder({
+            instance: this.instance,
+            tenant: this.config.tenant,
+            // responseType: this.responseType,
+            clientId: this.config.clientId,
+            // resource: this.resource,
+            redirectUri: this.config.redirectUri,
+            state: this.state,
+            slice: this.config.slice,
+            extraQueryParameter: this.config.extraQueryParameter,
+            correlationId: this.config.correlationId,
+            // nonce: this.nonce,
+            postLogoutRedirectUri: this.config.postLogoutRedirectUri,
+            logOutUri: this.config.logOutUri,
+        });
     }
 
     /**
@@ -417,7 +465,10 @@ export class AuthenticationContext {
         this.storage.set(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, existingIdTokenNonce + idTokenNonce + this.CONSTANTS.CACHE_DELIMETER);
         this.storage.set(this.STORAGE_CONSTANTS.ERROR, '');
         this.storage.set(this.STORAGE_CONSTANTS.ERROR_DESCRIPTION, '');
-        const urlNavigate = this._getNavigateUrl(RESPONSE_TYPE.ID_TOKEN) + '&nonce=' + encodeURIComponent(idTokenNonce);
+
+        const urlNavigate = this.getUrlBuilder()
+            .setNonce(idTokenNonce)
+            .forRedirect(RESPONSE_TYPE.ID_TOKEN);
 
         if (this.config.displayCall) {
             // User defined way of handling the navigation
@@ -449,8 +500,8 @@ export class AuthenticationContext {
              * window.innerWidth displays browser window's height and width excluding toolbars
              * using document.documentElement.clientWidth for IE8 and earlier
              */
-            const width = window.innerWidth || document.documentElement.clientWidth || document.body.clientWidth;
-            const height = window.innerHeight || document.documentElement.clientHeight || document.body.clientHeight;
+            const width = window.innerWidth || document.documentElement!.clientWidth || document.body.clientWidth;
+            const height = window.innerHeight || document.documentElement!.clientHeight || document.body.clientHeight;
             const left = ((width / 2) - (popUpWidth / 2)) + winLeft;
             const top = ((height / 2) - (popUpHeight / 2)) + winTop;
 
@@ -559,7 +610,7 @@ export class AuthenticationContext {
                 return false;
             }
 
-            function CustomEvent(eventName: string, params: any) {
+            function CustomEvent(eventName: string, params: any): CustomEvent {
                 params = params || { bubbles: false, cancelable: false, detail: undefined };
                 const evt = document.createEvent('CustomEvent');
                 evt.initCustomEvent(eventName, params.bubbles, params.cancelable, params.detail);
@@ -590,8 +641,11 @@ export class AuthenticationContext {
     protected _hasResource(key: string): boolean {
         const keys = this.storage.get(this.STORAGE_CONSTANTS.TOKEN_KEYS);
 
-        return !!keys
-            && (keys.indexOf(key + this.CONSTANTS.RESOURCE_DELIMETER) !== -1);
+        if (keys) {
+            return (keys.indexOf(key + this.CONSTANTS.RESOURCE_DELIMETER) !== -1);
+        }
+
+        return false;
     }
 
     /**
@@ -670,6 +724,12 @@ export class AuthenticationContext {
                             }
                             this._promiseForExpectedState.delete(expectedState);
                             this._activeRenewals.delete(resource);
+
+                            const frameId = 'adalIdTokenFrame';
+                            this.resetIFrameOnComplete(frameId);
+
+                        } else {
+                            // @TODO Received idToken that does not match login?
                         }
                     } else {
                         if (info.requestType === REQUEST_TYPE.RENEW_TOKEN && info.parameters.state === expectedState) {
@@ -681,6 +741,18 @@ export class AuthenticationContext {
                             }
                             this._promiseForExpectedState.delete(expectedState);
                             this._activeRenewals.delete(resource);
+
+                            const frameId = 'adalRenewFrameFor' + resource;
+                            this.resetIFrameOnComplete(frameId);
+
+                        } else {
+                            // @TODO Received something...
+                            if (info.requestType !== REQUEST_TYPE.RENEW_TOKEN) {
+                                // Not a renew token...
+                            }
+                            if (info.parameters.state !== expectedState) {
+                                // Not the expected state...
+                            }
                         }
                     }
                 });
@@ -689,6 +761,16 @@ export class AuthenticationContext {
         }
 
         return promise;
+    }
+
+    protected resetIFrameOnComplete(frameId: string): void {
+        const frameHandle = this._getAdalFrame(frameId);
+        frameHandle.src = 'about:blank';
+
+        if (frameId in this.iFrameTimeouts) {
+            window.clearTimeout(this.iFrameTimeouts[frameId]);
+            delete this.iFrameTimeouts[frameId];
+        }
     }
 
     /**
@@ -718,8 +800,7 @@ export class AuthenticationContext {
         // use given resource to create new auth url
         this.info('renewToken is called for resource: ' + resource);
 
-        const frameName = 'adalRenewFrameFor' + resource;
-        const frameHandle = this._addAdalFrame(frameName);
+        const frameId = 'adalRenewFrameFor' + resource;
         const expectedState = guid() + '|' + resource;
 
         this._state = expectedState;
@@ -729,23 +810,24 @@ export class AuthenticationContext {
 
         // remove the existing prompt=... query parameter and add prompt=none
         responseType = responseType || RESPONSE_TYPE.TOKEN;
-        let urlNavigate = this._urlRemoveQueryStringParameter(this._getNavigateUrl(responseType, resource), 'prompt');
+        const urlBuilder = this.getUrlBuilder()
+            .addParameterToRemove('prompt')
+            .setPrompt('none')
+            .addLoginHintForUser(this._user);
 
         if (responseType === this.RESPONSE_TYPE.ID_TOKEN_TOKEN) {
             const idTokenNonce = guid();
             const existingIdTokenNonce = this.storage.get(this.STORAGE_CONSTANTS.NONCE_IDTOKEN) || '';
             this.storage.set(this.STORAGE_CONSTANTS.NONCE_IDTOKEN, existingIdTokenNonce + idTokenNonce + this.CONSTANTS.CACHE_DELIMETER);
-            urlNavigate += '&nonce=' + encodeURIComponent(idTokenNonce);
+            urlBuilder.setNonce(idTokenNonce);
         }
 
-        urlNavigate = urlNavigate + '&prompt=none';
-        urlNavigate = this._addHintParameters(urlNavigate);
+        const urlNavigate = urlBuilder.forRedirect(responseType, resource);
 
         const promise = this.registerStateCallback(resource, expectedState);
         this.verbosePii('Navigate to: ' + urlNavigate);
-        frameHandle.src = 'about:blank';
 
-        this._loadFrameTimeout(urlNavigate, frameName, resource, REQUEST_TYPE.RENEW_TOKEN);
+        this._loadFrameTimeout(urlNavigate, frameId, resource, REQUEST_TYPE.RENEW_TOKEN);
 
         return promise;
     }
@@ -764,7 +846,6 @@ export class AuthenticationContext {
         // use iframe to try to renew token
         this.info('renewIdToken is called');
         const frameId = 'adalIdTokenFrame';
-        const frameHandle = this._addAdalFrame(frameId);
         const expectedState = guid() + '|' + this.config.clientId;
 
         const idTokenNonce = guid();
@@ -780,14 +861,15 @@ export class AuthenticationContext {
         const resource = (responseType == null ? undefined : this.config.clientId);
         responseType = responseType || RESPONSE_TYPE.ID_TOKEN;
 
-        let urlNavigate = this._urlRemoveQueryStringParameter(this._getNavigateUrl(responseType, resource), 'prompt');
-        urlNavigate = urlNavigate + '&prompt=none';
-        urlNavigate = this._addHintParameters(urlNavigate);
-        urlNavigate += '&nonce=' + encodeURIComponent(idTokenNonce);
+        const urlNavigate = this.getUrlBuilder()
+            .addParameterToRemove('prompt')
+            .setPrompt('none')
+            .addLoginHintForUser(this._user)
+            .setNonce(idTokenNonce)
+            .forRedirect(RESPONSE_TYPE.ID_TOKEN, resource);
 
         const promise = this.registerStateCallback(this.config.clientId, expectedState);
         this.verbosePii('Navigate to: ' + urlNavigate);
-        frameHandle.src = 'about:blank';
 
         this._loadFrameTimeout(urlNavigate, frameId, this.config.clientId, REQUEST_TYPE.LOGIN);
 
@@ -832,10 +914,16 @@ export class AuthenticationContext {
         this.storage.set(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_IN_PROGRESS);
         this._loadFrame(urlNavigation, frameName);
 
-        setTimeout(() => {
+        if (frameName in this.iFrameTimeouts) {
+            window.clearTimeout(this.iFrameTimeouts[frameName]);
+        }
+
+        this.iFrameTimeouts[frameName] = window.setTimeout(() => {
+            delete this.iFrameTimeouts[frameName];
+
             if (this.storage.get(this.STORAGE_CONSTANTS.RENEW_STATUS + resource) === this.CONSTANTS.TOKEN_RENEW_STATUS_IN_PROGRESS) {
                 // fail the iframe session if it's in pending state
-                this.verbose('Loading frame has timed out after: ' + (this.CONSTANTS.LOADFRAME_TIMEOUT / 1000) + ' seconds for resource ' + resource);
+                this.verbose('Loading frame has timed out after ' + (this.iframeLoadTimeout / 1000) + ' seconds for resource ' + resource);
                 const expectedState = this.getActiveRenewalForResource(resource);
 
                 if (expectedState) {
@@ -854,27 +942,59 @@ export class AuthenticationContext {
 
                 this.storage.set(this.STORAGE_CONSTANTS.RENEW_STATUS + resource, this.CONSTANTS.TOKEN_RENEW_STATUS_CANCELED);
             }
-        }, this.CONSTANTS.LOADFRAME_TIMEOUT);
+        }, this.iframeLoadTimeout);
     }
 
     /**
      * Loads iframe with authorization endpoint URL
      */
-    protected _loadFrame(urlNavigate: string, frameName: string): void {
+    protected _loadFrame(urlNavigate: string, frameName: string, retryCount?: number): number {
+        const isFirstCall = (retryCount == null);
+        const retryCountInternal = (retryCount == null ? 10 : retryCount);
+        const maxTimeoutDuration = 500;
+
         // This trick overcomes iframe navigation in IE
         // IE does not load the page consistently in iframe
-        this.info('LoadFrame: ' + frameName);
-        const frameCheck = frameName;
+        const loadFrameFn = (): number => {
+            let retryTimer: number = -1;
 
-        setTimeout(() => {
-            const frameHandle = this._addAdalFrame(frameCheck);
-
-            if (frameHandle.src === '' || frameHandle.src === 'about:blank') {
+            const frameHandle = this._getAdalFrame(frameName);
+            if (!frameHandle.src || frameHandle.src === 'about:blank') {
+                this.info('LoadFrame: ' + frameName + ', retries left: ' + retryCountInternal);
                 frameHandle.src = urlNavigate;
-                this._loadFrame(urlNavigate, frameCheck);
+
+                if (this.iframeLoadAsync) {
+                    retryTimer = this._loadFrame(urlNavigate, frameName, retryCountInternal - 1);
+
+                } else {
+                    retryTimer = window.setTimeout(() => {
+                        this._loadFrame(urlNavigate, frameName, retryCountInternal - 1);
+                    }, maxTimeoutDuration);
+                }
+
+                if (isFirstCall) {
+                    frameHandle.addEventListener(
+                        'load',
+                        (event) => {
+                            this.verbose('Frame "' + frameName + '" loaded ' + (isFirstCall ? 'on the first try' : 'after ' + retryCount +  ' retries'));
+                            window.clearTimeout(retryTimer);
+                        },
+                        true
+                    );
+                }
             }
 
-        }, 500);
+            return retryTimer;
+        };
+
+        if (this.iframeLoadAsync) {
+            const timeoutDuration = (isFirstCall ? 0 : maxTimeoutDuration);
+
+            return window.setTimeout(loadFrameFn, timeoutDuration);
+
+        } else {
+            return loadFrameFn();
+        }
     }
 
     /**
@@ -883,6 +1003,8 @@ export class AuthenticationContext {
      * @param {string} resource  -  ResourceUri identifying the target resource
      */
     public acquireToken(resource: string): Promise<string> {
+        this.verbose('Calling acquireToken for resource: ' + resource);
+
         let errorMessage: string;
 
         if (!resource) {
@@ -986,21 +1108,26 @@ export class AuthenticationContext {
         this._requestType = REQUEST_TYPE.RENEW_TOKEN;
         this.verbose('Renew token Expected state: ' + expectedState);
 
-        // remove the existing prompt=... query parameter and add prompt=select_account
-        let urlNavigate = this._urlRemoveQueryStringParameter(this._getNavigateUrl(RESPONSE_TYPE.TOKEN, resource), 'prompt');
-        urlNavigate = urlNavigate + '&prompt=select_account';
+        const urlBuilder = this.getUrlBuilder()
+            .addParameterToRemove('prompt')
+            // remove the existing prompt=... query parameter and add prompt=select_account
+            .setPrompt('select_account')
+            .addLoginHintForUser(this._user)
+            .setExtraQueryParameters(extraQueryParameters);
 
-        if (extraQueryParameters) {
-            urlNavigate += extraQueryParameters;
+        if (claims) {
+            if (
+                urlBuilder.forRedirect(RESPONSE_TYPE.TOKEN, resource)
+                    .indexOf('&claims') === -1
+            ) {
+                urlBuilder.setClaims(claims);
+            } else {
+                throw new Error('Claims cannot be passed as an extraQueryParameter');
+            }
         }
 
-        if (claims && (urlNavigate.indexOf('&claims') === -1)) {
-            urlNavigate += '&claims=' + encodeURIComponent(claims);
-        } else if (claims && (urlNavigate.indexOf('&claims') !== -1)) {
-            throw new Error('Claims cannot be passed as an extraQueryParameter');
-        }
+        const urlNavigate = urlBuilder.forRedirect(RESPONSE_TYPE.TOKEN, resource);
 
-        urlNavigate = this._addHintParameters(urlNavigate);
         this._acquireTokenInProgress = true;
         this.info('acquireToken interactive is called for the resource ' + resource);
         const promise = this.registerCallback(expectedState, resource, callback);
@@ -1070,21 +1197,26 @@ export class AuthenticationContext {
         this._state = expectedState;
         this.verbose('Renew token Expected state: ' + expectedState);
 
-        // remove the existing prompt=... query parameter and add prompt=select_account
-        let urlNavigate = this._urlRemoveQueryStringParameter(this._getNavigateUrl(RESPONSE_TYPE.TOKEN, resource), 'prompt');
-        urlNavigate = urlNavigate + '&prompt=select_account';
+        const urlBuilder = this.getUrlBuilder()
+            .addParameterToRemove('prompt')
+            // remove the existing prompt=... query parameter and add prompt=select_account
+            .setPrompt('select_account')
+            .addLoginHintForUser(this._user)
+            .setExtraQueryParameters(extraQueryParameters);
 
-        if (extraQueryParameters) {
-            urlNavigate += extraQueryParameters;
+        if (claims) {
+            if (
+                urlBuilder.forRedirect(RESPONSE_TYPE.TOKEN, resource)
+                    .indexOf('&claims') === -1
+            ) {
+                urlBuilder.setClaims(claims);
+            } else {
+                throw new Error('Claims cannot be passed as an extraQueryParameter');
+            }
         }
 
-        if (claims && (urlNavigate.indexOf('&claims') === -1)) {
-            urlNavigate += '&claims=' + encodeURIComponent(claims);
-        } else if (claims && (urlNavigate.indexOf('&claims') !== -1)) {
-            throw new Error('Claims cannot be passed as an extraQueryParameter');
-        }
+        const urlNavigate = urlBuilder.forRedirect(RESPONSE_TYPE.TOKEN, resource);
 
-        urlNavigate = this._addHintParameters(urlNavigate);
         this._acquireTokenInProgress = true;
         this.info('acquireToken interactive is called for the resource ' + resource);
         this.storage.set(this.STORAGE_CONSTANTS.LOGIN_REQUEST, window.location.href);
@@ -1113,6 +1245,8 @@ export class AuthenticationContext {
      * Clears cache items.
      */
     public clearCache(): void {
+        this._user = null;
+
         this.storage.set(this.STORAGE_CONSTANTS.LOGIN_REQUEST, '');
         this.storage.set(this.STORAGE_CONSTANTS.ANGULAR_LOGIN_REQUEST, '');
         this.storage.set(this.STORAGE_CONSTANTS.SESSION_STATE, '');
@@ -1163,21 +1297,9 @@ export class AuthenticationContext {
      */
     public logOut(): void {
         this.clearCache();
-        this._user = null;
-        let urlNavigate;
 
-        if (this.config.logOutUri) {
-            urlNavigate = this.config.logOutUri;
-        } else {
-            const tenant = (this.config.tenant ? this.config.tenant : 'common');
-            const logout = (
-                this.config.postLogoutRedirectUri
-                ? 'post_logout_redirect_uri=' + encodeURIComponent(this.config.postLogoutRedirectUri)
-                : ''
-            );
-
-            urlNavigate = this.instance + tenant + '/oauth2/logout?' + logout;
-        }
+        const urlNavigate = this.getUrlBuilder()
+            .forLogout();
 
         this.infoPii('Logout navigate to: ' + urlNavigate);
         this.redirectToUrl(urlNavigate);
@@ -1203,7 +1325,7 @@ export class AuthenticationContext {
 
         // frame is used to get idtoken
         const idToken = this.storage.get(this.STORAGE_CONSTANTS.IDTOKEN);
-        if (!!idToken) {
+        if (idToken) {
             this.info('User exists in cache: ');
             this._user = this._createUserFromIdToken(idToken);
             callback(undefined, this._user);
@@ -1320,12 +1442,18 @@ export class AuthenticationContext {
 
     public getClosestInstance(): AuthenticationContext {
         if (this.isRoot) {
+            this.verbose('Getting closest AuthenticationContext: (root) => (root)');
+
             return this;
         }
 
         if (this.isPopup) {
+            this.verbose('Getting closest AuthenticationContext: (popUp) => (root)');
+
             return (window.opener as WindowWithAdalContext)._adalInstance!;
         }
+
+        this.verbose('Getting closest AuthenticationContext: (iFrame) => (root)');
 
         return (window.parent as WindowWithAdalContext)._adalInstance!;
     }
@@ -1640,7 +1768,7 @@ export class AuthenticationContext {
      *
      * @param {string} [hash=window.location.hash] - Hash fragment of Url.
      */
-    public handleWindowCallback(hash?: string, noLocationChange: boolean = false, noHashChange: boolean = false): RequestInfo | null {
+    public handleWindowCallback(hash?: string, contextInfo: string = '', noLocationChange: boolean = false, noHashChange: boolean = false): RequestInfo | null {
         // This is for regular javascript usage for redirect handling
         // need to make sure this is for callback
         if (null == hash) {
@@ -1648,9 +1776,8 @@ export class AuthenticationContext {
         }
 
         if (this.isCallback(hash)) {
-            this.verbose('Getting closest AuthenticationContext...');
+            this.contextInfo = contextInfo;
             const self: AuthenticationContext = this.getClosestInstance();
-            self.verbose('...done!');
 
             // let isPopup = false;
             // if (
@@ -1672,7 +1799,7 @@ export class AuthenticationContext {
             self.info('Returned from redirect url');
             self.saveTokenFromHash(requestInfo);
 
-            const errorMessage = requestInfo.parameters.error_description || requestInfo.parameters.error;
+            // const errorMessage = requestInfo.parameters.error_description || requestInfo.parameters.error;
 
             if (requestInfo.requestType === REQUEST_TYPE.RENEW_TOKEN) {
                 if (!this.isRoot) {
@@ -1684,21 +1811,21 @@ export class AuthenticationContext {
                 token = requestInfo.parameters.access_token || requestInfo.parameters.id_token;
                 tokenType = TOKEN_TYPE.ACCESS_TOKEN;
 
-                if (errorMessage) {
-                    self._events.emit('renewTokenError', errorMessage, requestInfo.parameters.state, requestInfo.requestType);
-                } else {
-                    self._events.emit('renewTokenSuccess', token, requestInfo.parameters.state, requestInfo.requestType);
-                }
+                // if (errorMessage) {
+                //   self._events.emit('renewTokenError', errorMessage, requestInfo.parameters.state, requestInfo.requestType);
+                // } else {
+                //   self._events.emit('renewTokenSuccess', token, requestInfo.parameters.state, requestInfo.requestType);
+                // }
 
             } else if (requestInfo.requestType === REQUEST_TYPE.LOGIN) {
                 token = requestInfo.parameters.id_token;
                 tokenType = TOKEN_TYPE.ID_TOKEN;
 
-                if (errorMessage) {
-                    self._events.emit('renewIdTokenError', errorMessage);
-                } else {
-                    self._events.emit('renewIdTokenSuccess', token);
-                }
+                // if (errorMessage) {
+                //   self._events.emit('renewIdTokenError', errorMessage);
+                // } else {
+                //   self._events.emit('renewIdTokenSuccess', token);
+                // }
             }
 
             const errorDesc = requestInfo.parameters.error_description;
@@ -1739,10 +1866,101 @@ export class AuthenticationContext {
                 }
             }
 
+            this.contextInfo = '';
+
             return requestInfo;
         }
 
         return null;
+    }
+
+    /**
+     * This method must be called for processing the response received from AAD.
+     * It extracts the hash, processes the token or error, saves it in the cache and
+     * calls the registered callbacks with the result.
+     *
+     * @param {string} [hash] - Hash fragment of Url.
+     */
+    public handleFrameCallbackRequest(hash?: string, contextInfo?: string): boolean {
+        if (!this.isRoot) {
+            throw new Error('Trying to call method when not in root context');
+        }
+
+        this.verbose('Received a request to parse AAD response');
+
+        if (!hash || hash === '#') {
+            this.verbose('Received an empty payload. Skipping without raising an error.');
+
+            return false;
+        }
+
+        if (!this.isCallback(hash)) {
+            this.verbose('Received an invalid AAD response. Skipping without raising an error.');
+
+            return false;
+        }
+
+        this.contextInfo = contextInfo || '';
+
+        this.info('Received an AAD response. Parsing request info...');
+
+        const requestInfo = this.getRequestInfo(hash);
+        let token: string | undefined;
+        let tokenType: TOKEN_TYPE | undefined;
+
+        this.saveTokenFromHash(requestInfo);
+
+        if (requestInfo.requestType === REQUEST_TYPE.RENEW_TOKEN) {
+            token = requestInfo.parameters.access_token || requestInfo.parameters.id_token;
+            tokenType = TOKEN_TYPE.ACCESS_TOKEN;
+
+        } else if (requestInfo.requestType === REQUEST_TYPE.LOGIN) {
+            token = requestInfo.parameters.id_token;
+            tokenType = TOKEN_TYPE.ID_TOKEN;
+        }
+
+        const error = requestInfo.parameters.error;
+        const errorDescription = requestInfo.parameters.error_description;
+
+        const info = Object.create(null);
+        info.tokenType = tokenType;
+        info.parameters = requestInfo.parameters;
+        info.requestType = requestInfo.requestType;
+        info.stateMatch = requestInfo.stateMatch;
+        info.stateResponse = requestInfo.stateResponse;
+        info.valid = requestInfo.valid;
+
+        let errorObject = null;
+        if (error || errorDescription) {
+            errorObject = Object.create(null);
+            errorObject.message = error || errorDescription;
+            if (error && errorDescription) {
+                errorObject.description = errorDescription;
+            }
+        }
+
+        this._events.emit('tokenReceived', token || null, info, errorObject);
+
+        this.verbose('Done processing window callback');
+        this.verbose('Token: ' + token);
+        this.verbose('Info: ' + JSON.stringify(info));
+        this.verbose('Error: ' + (error ? JSON.stringify(errorObject) : 'No errors'));
+
+        this.contextInfo = '';
+
+        if (error === 'login_required' && requestInfo.requestType === REQUEST_TYPE.RENEW_TOKEN) {
+            const resource = this._getResourceFromState(requestInfo.stateResponse);
+            const testUrl = this.getUrlBuilder()
+                .addParameterToRemove('prompt')
+                .setPrompt('select_account')
+                .addLoginHintForUser(this._user)
+                .forRedirect(RESPONSE_TYPE.TOKEN, resource);
+
+            this.verbose('Open test url popup: ' + testUrl);
+            this._openPopup(testUrl, 'login', this.CONSTANTS.POPUP_WIDTH, this.CONSTANTS.POPUP_HEIGHT);
+        }
+
+        return true;
     }
 
     /**
@@ -1837,24 +2055,31 @@ export class AuthenticationContext {
     }
 
     /**
-     * Adds the hidden iframe for silent token renewal
+     * Gets the hidden iframe for silent token renewal.
+     * Creates a new element and appends it to the DOM if no elements exists yet
+     * for the given iframeId.
      */
-    protected _addAdalFrame(iframeId: string): HTMLIFrameElement {
-        this.info('Add adal frame to document: ' + iframeId);
-        const adalFrame = document.getElementById(iframeId) as HTMLIFrameElement;
+    protected _getAdalFrame(iframeId: string): HTMLIFrameElement {
+        const adalFrame = document.getElementById(iframeId) as (HTMLIFrameElement | null);
 
         if (!adalFrame) {
+            this.info('Add adal frame to document: ' + iframeId);
+
             const iframe = document.createElement('iframe');
             iframe.setAttribute('id', iframeId);
             iframe.setAttribute('aria-hidden', 'true');
-            iframe.style.visibility = 'hidden';
+            iframe.style.opacity = '0';
             iframe.style.position = 'absolute';
             iframe.style.width = '0px';
             iframe.style.height = '0px';
-            (iframe as any).borderWidth = '0px';
+            iframe.style.borderWidth = '0px';
+
+            iframe.src = 'about:blank';
 
             return document.body.appendChild(iframe);
         }
+
+        this.info('Return existing adal frame from document: ' + iframeId);
 
         return adalFrame;
     }
@@ -1941,10 +2166,10 @@ export class AuthenticationContext {
                 type = 'popUp';
             }
 
-            if (this.config.correlationId) {
-                formattedMessage = timestamp + ': (' + type + ') ' + this.config.correlationId + '-' + AuthenticationContext.VERSION + '-' + levelStr + ' ' + message;
+            if (this.config && this.config.correlationId) {
+                formattedMessage = timestamp + ': (' + type + (this.contextInfo ? ' from ' + this.contextInfo : '') + ') ' + this.config.correlationId + '-' + AuthenticationContext.VERSION + '-' + levelStr + ' ' + message;
             } else {
-                formattedMessage = timestamp + ': (' + type + ') ' + AuthenticationContext.VERSION + '-' + levelStr + ' ' + message;
+                formattedMessage = timestamp + ': (' + type + (this.contextInfo ? ' from ' + this.contextInfo : '') + ') ' + AuthenticationContext.VERSION + '-' + levelStr + ' ' + message;
             }
 
             if (error) {
@@ -1955,7 +2180,7 @@ export class AuthenticationContext {
                 }
             }
 
-            Logging.log(formattedMessage);
+            Logging.log(formattedMessage, message, level);
         }
     }
 
@@ -2066,9 +2291,7 @@ export class AdalService {
 
         (window as WindowWithAdalContext).AuthenticationContext = this.context.constructor as AuthenticationContextStatic;
 
-        this.context.onTokenReceived((token: string | null, info: TokenReceivedCallbackInfo, error: { message: string, description?: string } | null) => {
-            console.info('onTokenReceived', token, info, error);
-
+        this.context.onTokenReceived((token: string | null, info: TokenReceivedCallbackInfo, error: {message: string, description?: string} | null) => {
             if (this.context.isRoot) {
                 if (info.requestType === REQUEST_TYPE.LOGIN) {
                     this.updateDataFromCache();
@@ -2182,7 +2405,7 @@ export class AdalService {
 
     private updateDataFromCache(): void {
         const token = this.context.getCachedToken(this.context.config.loginResource);
-        this.user.authenticated = (!!token);
+        this.user.authenticated = (token != null);
 
         const user = this.context.getCachedUser();
 
@@ -2227,7 +2450,7 @@ export class AdalService {
     }
 
     private get isInCallbackRedirectMode(): boolean {
-        return window.location.href.indexOf('#access_token') !== -1 || window.location.href.indexOf('#id_token') !== -1;
+        return this.context.isCallback(window.location.hash);
     }
 
     private setupLoginTokenRefreshTimer(): void {
